@@ -46,8 +46,8 @@ int main(int argc, char ** argv) {
     LOG_INF("llama-pull: downloading model...\n");
     try {
         // Use the existing model handling logic which downloads the model
-        common_init_result llama_init = common_init_from_params(params);
-        if (llama_init.model != nullptr) {
+        auto llama_init = common_init_from_params(params);
+        if (llama_init->model() != nullptr) {
             LOG_INF("Model downloaded and loaded successfully to: %s\n", params.model.path.c_str());
 
             // We only want to download, not keep the model loaded
