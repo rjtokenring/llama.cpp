@@ -570,6 +570,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
 
+    if (!params.model.hf_repo.empty() && !params.model.docker_repo.empty()) {
+        throw std::invalid_argument("error: cannot specify both -hf and -dr options\n");
+    }
+
     // handle model and download
     {
         auto res = common_params_handle_model(params.model, params.hf_token, params.offline);
