@@ -64,7 +64,7 @@ static u32vec opt_pmu_evt { 0x3, 0x111, 0x100, 0x105, 0x240, 0x256, 0x7D, 0x8C }
 
 // Enable all stages by default
 static int opt_opstage  = HTP_OPSTAGE_QUEUE | HTP_OPSTAGE_COMPUTE;
-static int opt_opbatch  = 1024; // max number of ops in a batch
+static int opt_opbatch  = 2048; // max number of ops in a batch
 static int opt_opqueue  = 16;   // max number of pending batches
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 
@@ -1862,13 +1862,16 @@ struct ggml_hexagon_opqueue {
             GGML_ASSERT(rsp.n_ops <= ops.size());
 
             const htp_prof_desc * pd = (const htp_prof_desc *) p_ptr;
+            auto t_prof_start = std::chrono::high_resolution_clock::now();
             for (uint32_t i = 0; i < rsp.n_ops; i++) {
                 htp_usec += pd[i].usecs;
                 ggml_hexagon_dump_op_prof(shm_buf->sess->name, ops[i], pd[i].usecs, pd[i].cycles, pd[i].pmu);
             }
+            auto t_prof_end = std::chrono::high_resolution_clock::now();
+            auto prof_us = std::chrono::duration_cast<std::chrono::microseconds>(t_prof_end - t_prof_start).count();
 
-            GGML_LOG_DEBUG("ggml-hex: %s profile-batch n-ops %u batch-dur-usec %lld htp-ops-usec %u\n",
-                           shm_buf->sess->c_name(), rsp.n_ops, (long long) batch_usec, htp_usec);
+            GGML_LOG_DEBUG("ggml-hex: %s profile-batch n-ops %u batch-dur-usec %lld htp-ops-usec %u prof-log-usec %lld\n",
+                           shm_buf->sess->c_name(), rsp.n_ops, (long long) batch_usec, htp_usec, (long long) prof_us);
         }
     }
 };
@@ -2244,10 +2247,6 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
                 return false;
             }
 
-            if (ggml_nrows(src0) > 16 * 1024) {
-                return false;  // typically the lm-head which would be too large for VTCM
-            }
-
             if (ggml_nrows(src1) > 1024 || src1->ne[2] != 1 || src1->ne[3] != 1) {
                 return false;  // no huge batches or broadcasting (for now)
             }
@@ -2531,8 +2530,12 @@ static bool ggml_hexagon_supported_get_rows(const struct ggml_hexagon_session * 
     const struct ggml_tensor * src1 = op->src[1]; // indices
     const struct ggml_tensor * dst  = op;
 
-    if (src0->type != GGML_TYPE_F32) {
-        return false;
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_Q4_0:
+            break;
+        default:
+            return false;
     }
 
     if (src1->type != GGML_TYPE_I32 && src1->type != GGML_TYPE_I64) {
@@ -2769,6 +2772,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
             switch (ggml_get_unary_op(t)) {
                 case GGML_UNARY_OP_SILU:     return HTP_OP_UNARY_SILU;
                 case GGML_UNARY_OP_GELU:     return HTP_OP_UNARY_GELU;
+                case GGML_UNARY_OP_TANH:     return HTP_OP_UNARY_TANH;
                 case GGML_UNARY_OP_SIGMOID:  return HTP_OP_UNARY_SIGMOID;
                 case GGML_UNARY_OP_NEG:      return HTP_OP_UNARY_NEG;
                 case GGML_UNARY_OP_EXP:      return HTP_OP_UNARY_EXP;
@@ -2803,6 +2807,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
+    auto t_start = std::chrono::high_resolution_clock::now();
+
     for (int i = 0; i < graph->n_nodes; ++i) {
         ggml_tensor * n = graph->nodes[i];
         if (op_is_compute(n) && (opt_opstage & HTP_OPSTAGE_QUEUE)) {
@@ -2810,8 +2816,20 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         }
     }
 
+    auto t_serialized = std::chrono::high_resolution_clock::now();
+
     // Wait until all pending ops complete
     sess->flush();
+
+    if (opt_profile) {
+        auto t_end = std::chrono::high_resolution_clock::now();
+        auto ser_us = std::chrono::duration_cast<std::chrono::microseconds>(t_serialized - t_start).count();
+        auto flush_us = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_serialized).count();
+        auto dur_us = ser_us + flush_us;
+        GGML_LOG_DEBUG("ggml-hex: %s graph-compute-time n_nodes %d usec %lld serialize %lld flush %lld\n",
+                       sess->c_name(), graph->n_nodes, (long long) dur_us,
+                       (long long) ser_us, (long long) flush_us);
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -3244,6 +3262,9 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
                 case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_GELU:
                     supp = ggml_hexagon_supported_activations(sess, op);
+                    break;
+                case GGML_UNARY_OP_TANH:
+                    supp = ggml_hexagon_supported_unary(sess, op);
                     break;
                 default:
                     break;

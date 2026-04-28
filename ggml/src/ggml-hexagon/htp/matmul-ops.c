@@ -36,6 +36,11 @@ struct htp_matmul_context {
          const void * restrict vx0, const void * restrict vx1,
          const void * restrict vy0);
 
+    void (*vec_dot_4x1)(const int n, float * restrict s0,
+         const void * restrict vx0, const void * restrict vx1,
+         const void * restrict vx2, const void * restrict vx3,
+         const void * restrict vy0);
+
     void (*vec_dot_2x2)(const int n, float * restrict s0, float * restrict s1,
          const void * restrict vx0, const void * restrict vx1,
          const void * restrict vy0, const void * restrict vy1);
@@ -568,6 +573,122 @@ static void vec_dot_q4x4x2_q8x4x2_2x1(const int n, float * restrict s0,
 
     HVX_Vector rsum = hvx_vec_reduce_sum_f32x2(r0_sum, r1_sum);
     hvx_vec_store_u(s0, 8, rsum);
+}
+
+static void vec_dot_q4x4x2_q8x4x2_4x1(const int n, float * restrict s0,
+                                      const void * restrict vx0, const void * restrict vx1,
+                                      const void * restrict vx2, const void * restrict vx3,
+                                      const void * restrict vy0) {
+    assert(n % 32 == 0);
+    assert((unsigned long) vx0 % 128 == 0);
+    assert((unsigned long) vx1 % 128 == 0);
+    assert((unsigned long) vx2 % 128 == 0);
+    assert((unsigned long) vx3 % 128 == 0);
+    assert((unsigned long) vy0 % 128 == 0);
+
+    const uint32_t qk = QK_Q4_0x4x2 * 4;
+
+    const uint32_t x_dblk_size = 8 * 4 * 2;
+    const uint32_t x_qblk_size = qk / 2;
+    const uint32_t x_qrow_size = n / 2;
+
+    const uint32_t y_dblk_size = 8 * 4 * 2;
+    const uint32_t y_qblk_size = qk;
+    const uint32_t y_qrow_size = n;
+
+    const uint8_t * restrict r0_x_q = ((const uint8_t *) vx0) + 0;
+    const uint8_t * restrict r0_x_d = ((const uint8_t *) vx0) + x_qrow_size;
+    const uint8_t * restrict r1_x_q = ((const uint8_t *) vx1) + 0;
+    const uint8_t * restrict r1_x_d = ((const uint8_t *) vx1) + x_qrow_size;
+    const uint8_t * restrict r2_x_q = ((const uint8_t *) vx2) + 0;
+    const uint8_t * restrict r2_x_d = ((const uint8_t *) vx2) + x_qrow_size;
+    const uint8_t * restrict r3_x_q = ((const uint8_t *) vx3) + 0;
+    const uint8_t * restrict r3_x_d = ((const uint8_t *) vx3) + x_qrow_size;
+
+    const uint8_t * restrict y_q = ((const uint8_t *) vy0 + 0);
+    const uint8_t * restrict y_d = ((const uint8_t *) vy0 + y_qrow_size);
+
+    HVX_Vector r0_sum = Q6_V_vzero();
+    HVX_Vector r1_sum = Q6_V_vzero();
+    HVX_Vector r2_sum = Q6_V_vzero();
+    HVX_Vector r3_sum = Q6_V_vzero();
+
+    const uint32_t nb   = n / qk;
+    const uint32_t nloe = n % qk;
+
+    uint32_t i = 0;
+    for (; i < nb; i++) {
+        HVX_Vector_x8 vy_q = hvx_vec_load_q8x4x8_full(y_q    + i * y_qblk_size);
+        HVX_Vector_x8 r0_q = hvx_vec_load_q4x4x8_full(r0_x_q + i * x_qblk_size);
+        HVX_Vector_x8 r1_q = hvx_vec_load_q4x4x8_full(r1_x_q + i * x_qblk_size);
+        HVX_Vector_x8 r2_q = hvx_vec_load_q4x4x8_full(r2_x_q + i * x_qblk_size);
+        HVX_Vector_x8 r3_q = hvx_vec_load_q4x4x8_full(r3_x_q + i * x_qblk_size);
+
+        HVX_Vector r0_ia = Q6_Vsf_equals_Vw(hvx_vec_rmpy_x8_full(r0_q, vy_q));
+        HVX_Vector r1_ia = Q6_Vsf_equals_Vw(hvx_vec_rmpy_x8_full(r1_q, vy_q));
+        HVX_Vector r2_ia = Q6_Vsf_equals_Vw(hvx_vec_rmpy_x8_full(r2_q, vy_q));
+        HVX_Vector r3_ia = Q6_Vsf_equals_Vw(hvx_vec_rmpy_x8_full(r3_q, vy_q));
+
+        HVX_Vector vy_d = Q6_Vh_vshuff_Vh(*(const HVX_UVector *) (y_d    + i * y_dblk_size));
+        HVX_Vector r0_d = Q6_Vh_vshuff_Vh(*(const HVX_UVector *) (r0_x_d + i * x_dblk_size));
+        HVX_Vector r1_d = Q6_Vh_vshuff_Vh(*(const HVX_UVector *) (r1_x_d + i * x_dblk_size));
+        HVX_Vector r2_d = Q6_Vh_vshuff_Vh(*(const HVX_UVector *) (r2_x_d + i * x_dblk_size));
+        HVX_Vector r3_d = Q6_Vh_vshuff_Vh(*(const HVX_UVector *) (r3_x_d + i * x_dblk_size));
+
+        HVX_Vector r0_dd = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(Q6_Wqf32_vmpy_VhfVhf(r0_d, vy_d)));
+        HVX_Vector r1_dd = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(Q6_Wqf32_vmpy_VhfVhf(r1_d, vy_d)));
+        HVX_Vector r2_dd = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(Q6_Wqf32_vmpy_VhfVhf(r2_d, vy_d)));
+        HVX_Vector r3_dd = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(Q6_Wqf32_vmpy_VhfVhf(r3_d, vy_d)));
+
+        HVX_Vector r0_fa = Q6_Vqf32_vmpy_VsfVsf(r0_ia, r0_dd);
+        HVX_Vector r1_fa = Q6_Vqf32_vmpy_VsfVsf(r1_ia, r1_dd);
+        HVX_Vector r2_fa = Q6_Vqf32_vmpy_VsfVsf(r2_ia, r2_dd);
+        HVX_Vector r3_fa = Q6_Vqf32_vmpy_VsfVsf(r3_ia, r3_dd);
+
+        r0_sum = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(r0_fa, r0_sum));
+        r1_sum = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(r1_fa, r1_sum));
+        r2_sum = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(r2_fa, r2_sum));
+        r3_sum = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(r3_fa, r3_sum));
+    }
+
+    if (nloe) {
+        HVX_Vector_x8 vy_q = hvx_vec_load_q8x4x8_partial(y_q    + i * y_qblk_size, nloe);
+        HVX_Vector_x8 r0_q = hvx_vec_load_q4x4x8_partial(r0_x_q + i * x_qblk_size, nloe);
+        HVX_Vector_x8 r1_q = hvx_vec_load_q4x4x8_partial(r1_x_q + i * x_qblk_size, nloe);
+        HVX_Vector_x8 r2_q = hvx_vec_load_q4x4x8_partial(r2_x_q + i * x_qblk_size, nloe);
+        HVX_Vector_x8 r3_q = hvx_vec_load_q4x4x8_partial(r3_x_q + i * x_qblk_size, nloe);
+
+        HVX_Vector r0_ia = Q6_Vsf_equals_Vw(hvx_vec_rmpy_x8_partial(r0_q, vy_q, nloe));
+        HVX_Vector r1_ia = Q6_Vsf_equals_Vw(hvx_vec_rmpy_x8_partial(r1_q, vy_q, nloe));
+        HVX_Vector r2_ia = Q6_Vsf_equals_Vw(hvx_vec_rmpy_x8_partial(r2_q, vy_q, nloe));
+        HVX_Vector r3_ia = Q6_Vsf_equals_Vw(hvx_vec_rmpy_x8_partial(r3_q, vy_q, nloe));
+
+        HVX_Vector vy_d = Q6_Vh_vshuff_Vh(*(const HVX_UVector *) (y_d    + i * y_dblk_size));
+        HVX_Vector r0_d = Q6_Vh_vshuff_Vh(*(const HVX_UVector *) (r0_x_d + i * x_dblk_size));
+        HVX_Vector r1_d = Q6_Vh_vshuff_Vh(*(const HVX_UVector *) (r1_x_d + i * x_dblk_size));
+        HVX_Vector r2_d = Q6_Vh_vshuff_Vh(*(const HVX_UVector *) (r2_x_d + i * x_dblk_size));
+        HVX_Vector r3_d = Q6_Vh_vshuff_Vh(*(const HVX_UVector *) (r3_x_d + i * x_dblk_size));
+
+        HVX_Vector r0_dd = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(Q6_Wqf32_vmpy_VhfVhf(r0_d, vy_d)));
+        HVX_Vector r1_dd = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(Q6_Wqf32_vmpy_VhfVhf(r1_d, vy_d)));
+        HVX_Vector r2_dd = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(Q6_Wqf32_vmpy_VhfVhf(r2_d, vy_d)));
+        HVX_Vector r3_dd = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(Q6_Wqf32_vmpy_VhfVhf(r3_d, vy_d)));
+
+        HVX_VectorPred bmask = Q6_Q_vsetq_R(nloe / 8);
+        r0_dd = Q6_V_vand_QV(bmask, r0_dd); r0_ia = Q6_V_vand_QV(bmask, r0_ia);
+        r1_dd = Q6_V_vand_QV(bmask, r1_dd); r1_ia = Q6_V_vand_QV(bmask, r1_ia);
+        r2_dd = Q6_V_vand_QV(bmask, r2_dd); r2_ia = Q6_V_vand_QV(bmask, r2_ia);
+        r3_dd = Q6_V_vand_QV(bmask, r3_dd); r3_ia = Q6_V_vand_QV(bmask, r3_ia);
+
+        r0_sum = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(r0_ia, r0_dd), r0_sum));
+        r1_sum = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(r1_ia, r1_dd), r1_sum));
+        r2_sum = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(r2_ia, r2_dd), r2_sum));
+        r3_sum = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(r3_ia, r3_dd), r3_sum));
+    }
+
+    HVX_Vector_x4 rsum4 = {{ r0_sum, r1_sum, r2_sum, r3_sum }};
+    HVX_Vector rsum = hvx_vec_reduce_sum_f32x4(rsum4);
+    hvx_vec_store_u(s0, 16, rsum);
 }
 
 static void vec_dot_q4x4x2_q8x4x2_2x2(const int n, float * restrict s0, float * restrict s1,
@@ -2138,7 +2259,9 @@ static void matvec_2d(unsigned int nth, unsigned int ith, void * data) {
 
     const uint32_t src0_start_row  = src0_nrows_per_thread * ith;
     const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows);
-    const uint32_t src0_end_row_x2 = src0_start_row + ((src0_end_row - src0_start_row) & ~1U);
+    const uint32_t src0_nrows_this = src0_end_row - src0_start_row;
+    const uint32_t src0_end_row_x4 = src0_start_row + (src0_nrows_this & ~3U);
+    const uint32_t src0_end_row_x2 = src0_start_row + (src0_nrows_this & ~1U);
 
     // no work for this thread
     if (src0_start_row >= src0_end_row) {
@@ -2168,39 +2291,88 @@ static void matvec_2d(unsigned int nth, unsigned int ith, void * data) {
     const uint8_t * restrict src1_col = (const uint8_t *) src1_data;
     float * restrict dst_col          = (float *) dst->data;
 
-    // Prefill spad with 2x src0 rows
-    #pragma unroll(2)
-    for (uint32_t ir0 = src0_start_row; ir0 < src0_end_row_x2; ir0 += 2) {
-        const uint32_t is0 = (ir0 - src0_start_row);
-        if (is0 >= MM_SPAD_SRC0_NROWS) {
-            break;
+    // 4x1 path: process 4 rows at a time when vec_dot_4x1 is available
+    if (mmctx->vec_dot_4x1 && src0_end_row_x4 > src0_start_row) {
+        // Prefill spad with 4x src0 rows
+        for (uint32_t ir0 = src0_start_row; ir0 < src0_end_row_x4; ir0 += 4) {
+            const uint32_t is0 = (ir0 - src0_start_row);
+            if (is0 >= MM_SPAD_SRC0_NROWS) {
+                break;
+            }
+            dma_queue_push_ddr_to_vtcm(dma_queue, dma_make_ptr(spad_src0 + is0 * src0_stride, src0_row + ir0 * src0_row_size),
+                           src0_stride, src0_row_size, 4);
         }
-        dma_queue_push_ddr_to_vtcm(dma_queue, dma_make_ptr(spad_src0 + is0 * src0_stride, src0_row + ir0 * src0_row_size),
-                       src0_stride, src0_row_size, 2);
-    }
 
-    // Process src0 rows
-    for (uint32_t ir0 = src0_start_row; ir0 < src0_end_row_x2; ir0 += 2) {
-        const uint8_t * ss0 = dma_queue_pop(dma_queue).dst;
-        mmctx->vec_dot_2x1(ne00, &tmp[ir0 - src0_start_row], ss0, ss0 + src0_stride, src1_col);
+        // Process src0 rows in groups of 4
+        for (uint32_t ir0 = src0_start_row; ir0 < src0_end_row_x4; ir0 += 4) {
+            const uint8_t * ss0 = dma_queue_pop(dma_queue).dst;
+            mmctx->vec_dot_4x1(ne00, &tmp[ir0 - src0_start_row],
+                               ss0, ss0 + src0_stride, ss0 + 2 * src0_stride, ss0 + 3 * src0_stride, src1_col);
 
-        // Prefetch next (n + spad_nrows) row
-        const uint32_t pr0 = (ir0 + MM_SPAD_SRC0_NROWS);
-        const uint32_t is0 = (pr0 - src0_start_row) % MM_SPAD_SRC0_NROWS;
-        if (pr0 < src0_end_row_x2) {
-            dma_queue_push_ddr_to_vtcm(dma_queue, dma_make_ptr(spad_src0 + is0 * src0_stride, src0_row + pr0 * src0_row_size),
+            // Prefetch next (n + spad_nrows) rows
+            const uint32_t pr0 = (ir0 + MM_SPAD_SRC0_NROWS);
+            const uint32_t is0 = (pr0 - src0_start_row) % MM_SPAD_SRC0_NROWS;
+            if (pr0 < src0_end_row_x4) {
+                dma_queue_push_ddr_to_vtcm(dma_queue, dma_make_ptr(spad_src0 + is0 * src0_stride, src0_row + pr0 * src0_row_size),
+                               src0_stride, src0_row_size, 4);
+            }
+        }
+
+        // Handle remaining 2-row chunk (if src0_nrows_this % 4 >= 2)
+        if (src0_end_row_x4 < src0_end_row_x2) {
+            const uint32_t ir0 = src0_end_row_x4;
+            const uint32_t is0 = (ir0 - src0_start_row) % MM_SPAD_SRC0_NROWS;
+            dma_queue_push_ddr_to_vtcm(dma_queue, dma_make_ptr(spad_src0 + is0 * src0_stride, src0_row + ir0 * src0_row_size),
+                           src0_stride, src0_row_size, 2);
+            const uint8_t * ss0 = dma_queue_pop(dma_queue).dst;
+            mmctx->vec_dot_2x1(ne00, &tmp[ir0 - src0_start_row], ss0, ss0 + src0_stride, src1_col);
+        }
+
+        // Handle remaining 1 row (if odd)
+        if (src0_end_row != src0_end_row_x2) {
+            const uint32_t ir0 = src0_end_row_x2;
+            const uint32_t is0 = (ir0 - src0_start_row) % MM_SPAD_SRC0_NROWS;
+            dma_queue_push_ddr_to_vtcm(dma_queue, dma_make_ptr(spad_src0 + is0 * src0_stride, src0_row + ir0 * src0_row_size),
+                           src0_stride, src0_row_size, 1);
+            const uint8_t * ss0 = dma_queue_pop(dma_queue).dst;
+            mmctx->vec_dot_1x1(ne00, &tmp[ir0 - src0_start_row], ss0, src1_col);
+        }
+    } else {
+        // Fallback: original 2x1 path
+        // Prefill spad with 2x src0 rows
+        #pragma unroll(2)
+        for (uint32_t ir0 = src0_start_row; ir0 < src0_end_row_x2; ir0 += 2) {
+            const uint32_t is0 = (ir0 - src0_start_row);
+            if (is0 >= MM_SPAD_SRC0_NROWS) {
+                break;
+            }
+            dma_queue_push_ddr_to_vtcm(dma_queue, dma_make_ptr(spad_src0 + is0 * src0_stride, src0_row + ir0 * src0_row_size),
                            src0_stride, src0_row_size, 2);
         }
-    }
 
-    // Process the last row (if any)
-    if (src0_end_row != src0_end_row_x2) {
-        const uint32_t ir0 = src0_end_row_x2;
-        const uint32_t is0 = (ir0 - src0_start_row);
-        dma_queue_push_ddr_to_vtcm(dma_queue, dma_make_ptr(spad_src0 + is0 * src0_stride, src0_row + ir0 * src0_row_size),
-                       src0_stride, src0_row_size, 1);
-        const uint8_t * ss0 = dma_queue_pop(dma_queue).dst;
-        mmctx->vec_dot_1x1(ne00, &tmp[ir0 - src0_start_row], ss0, src1_col);
+        // Process src0 rows
+        for (uint32_t ir0 = src0_start_row; ir0 < src0_end_row_x2; ir0 += 2) {
+            const uint8_t * ss0 = dma_queue_pop(dma_queue).dst;
+            mmctx->vec_dot_2x1(ne00, &tmp[ir0 - src0_start_row], ss0, ss0 + src0_stride, src1_col);
+
+            // Prefetch next (n + spad_nrows) row
+            const uint32_t pr0 = (ir0 + MM_SPAD_SRC0_NROWS);
+            const uint32_t is0 = (pr0 - src0_start_row) % MM_SPAD_SRC0_NROWS;
+            if (pr0 < src0_end_row_x2) {
+                dma_queue_push_ddr_to_vtcm(dma_queue, dma_make_ptr(spad_src0 + is0 * src0_stride, src0_row + pr0 * src0_row_size),
+                               src0_stride, src0_row_size, 2);
+            }
+        }
+
+        // Process the last row (if any)
+        if (src0_end_row != src0_end_row_x2) {
+            const uint32_t ir0 = src0_end_row_x2;
+            const uint32_t is0 = (ir0 - src0_start_row);
+            dma_queue_push_ddr_to_vtcm(dma_queue, dma_make_ptr(spad_src0 + is0 * src0_stride, src0_row + ir0 * src0_row_size),
+                           src0_stride, src0_row_size, 1);
+            const uint8_t * ss0 = dma_queue_pop(dma_queue).dst;
+            mmctx->vec_dot_1x1(ne00, &tmp[ir0 - src0_start_row], ss0, src1_col);
+        }
     }
 
     hvx_copy_f32_ua((uint8_t *) &dst_col[src0_start_row], (uint8_t *) tmp, src0_end_row - src0_start_row);
@@ -2750,24 +2922,28 @@ static int htp_mminit_vec_dot(struct htp_matmul_context * mmctx, enum htp_data_t
             mmctx->type        = "q4x4x2-f32";
             mmctx->vec_dot_1x1 = vec_dot_q4x4x2_q8x4x2_1x1;
             mmctx->vec_dot_2x1 = vec_dot_q4x4x2_q8x4x2_2x1;
+            mmctx->vec_dot_4x1 = vec_dot_q4x4x2_q8x4x2_4x1;
             mmctx->vec_dot_2x2 = vec_dot_q4x4x2_q8x4x2_2x2;
             return 0;
         case HTP_TYPE_Q8_0:
             mmctx->type        = "q8x4x2-f32";
             mmctx->vec_dot_1x1 = vec_dot_q8x4x2_q8x4x2_1x1;
             mmctx->vec_dot_2x1 = vec_dot_q8x4x2_q8x4x2_2x1;
+            mmctx->vec_dot_4x1 = NULL;
             mmctx->vec_dot_2x2 = vec_dot_q8x4x2_q8x4x2_2x2;
             return 0;
         case HTP_TYPE_IQ4_NL:
             mmctx->type        = "iq4nlx4x2-f32";
             mmctx->vec_dot_1x1 = vec_dot_iq4nlx4x2_q8x4x2_1x1;
             mmctx->vec_dot_2x1 = vec_dot_iq4nlx4x2_q8x4x2_2x1;
+            mmctx->vec_dot_4x1 = NULL;
             mmctx->vec_dot_2x2 = vec_dot_iq4nlx4x2_q8x4x2_2x2;
             return 0;
         case HTP_TYPE_MXFP4:
             mmctx->type        = "mxfp4x4x2-f32";
             mmctx->vec_dot_1x1 = vec_dot_mxfp4x4x2_q8x4x2_1x1;
             mmctx->vec_dot_2x1 = vec_dot_mxfp4x4x2_q8x4x2_2x1;
+            mmctx->vec_dot_4x1 = NULL;
             mmctx->vec_dot_2x2 = vec_dot_mxfp4x4x2_q8x4x2_2x2;
             return 0;
         default:
@@ -2897,6 +3073,19 @@ static int op_matmul_hvx(struct htp_ops_context * octx) {
         quant_job_func = quantize_f32_q8x4x2;
         src1_row_size  = q8x4x2_row_size(ne10);
         htp_mminit_spad(octx, dst_row_size, src0_row_size_padded, src1_row_size, src1_nrows, 0);
+    }
+
+    // Fix dst_spad for matvec: only needs src0_nrows_per_thread floats per thread
+    // For matmul (M>1), matmul_2d writes directly to DDR, dst_spad is unused
+    if (src1_nrows == 1) {
+        size_t dst_per_thread = hex_round_up((size_t) mmctx->src0_nrows_per_thread * sizeof(float), 256);
+        if (dst_per_thread < octx->dst_spad.size_per_thread) {
+            octx->dst_spad.size_per_thread = dst_per_thread;
+            octx->dst_spad.size = dst_per_thread * octx->n_threads;
+        }
+    } else if (matmul_job_func == matmul_2d) {
+        octx->dst_spad.size_per_thread = 256;
+        octx->dst_spad.size = 256 * octx->n_threads;
     }
 
     // VTCM scratchpads for all tensors

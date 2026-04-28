@@ -545,6 +545,7 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_SIGMOID:
         case HTP_OP_UNARY_NEG:
         case HTP_OP_UNARY_EXP:
+        case HTP_OP_UNARY_TANH:
             return op_unary(octx);
 
         case HTP_OP_UNARY_SILU:
@@ -722,7 +723,18 @@ static void prep_tensors(struct htp_context *ctx, struct htp_buf_desc *bufs, str
     }
 }
 
-static void proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, uint32_t idx, struct htp_op_desc * op) {
+// Per-batch overhead accumulator (only populated when profiler is active)
+struct batch_overhead {
+    uint64_t l2flush_input_us;
+    uint64_t l2flush_output_us;
+    uint64_t prep_tensors_us;
+    uint32_t l2flush_input_count;
+    uint32_t l2flush_output_count;
+    uint32_t l2flush_full_count;  // full dcache flushes (size > 128KB)
+};
+
+static void proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, uint32_t idx, struct htp_op_desc * op,
+                        struct batch_overhead * ovh) {
     memcpy(octx->op_params, op->params, sizeof(octx->op_params));
     octx->flags = op->flags;
     octx->op    = op->opcode;
@@ -737,8 +749,13 @@ static void proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, 
         if (!src) continue;
 
         if (!(src->flags & HTP_TENSOR_FLUSHED) && (src->flags & HTP_TENSOR_COMPUTE)) {
-            // flush compute buffers on input
+            uint64_t t0 = HAP_perf_get_qtimer_count();
             hex_l2flush((void *) src->data, src->size);
+            if (ovh) {
+                ovh->l2flush_input_us += HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
+                ovh->l2flush_input_count++;
+                if (src->size > HEX_L2_FLUSH_SIZE) ovh->l2flush_full_count++;
+            }
         }
 
         FARF(HIGH, "prep-src #%u: data %p size %u : %u:%u:%u:%u", op->src[i], (void*) src->data, src->size,
@@ -756,7 +773,15 @@ static void proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, 
     (void) execute_op(octx);
 
     // flush buffers on output
-    hex_l2flush((void *) dst->data, dst->size);
+    {
+        uint64_t t0 = HAP_perf_get_qtimer_count();
+        hex_l2flush((void *) dst->data, dst->size);
+        if (ovh) {
+            ovh->l2flush_output_us += HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
+            ovh->l2flush_output_count++;
+            if (dst->size > HEX_L2_FLUSH_SIZE) ovh->l2flush_full_count++;
+        }
+    }
     dst->flags |= HTP_TENSOR_FLUSHED;
 
     FARF(HIGH, "post-dst #%u: data %p size %u : %u:%u:%u:%u", op->dst, (void*) dst->data, dst->size,
@@ -837,12 +862,15 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
         octx->n_threads = ctx->n_threads;
         octx->ctx       = ctx;
 
+        struct batch_overhead ovh = {0};
+        uint64_t batch_t0 = HAP_perf_get_qtimer_count();
+
         for (uint32_t i=0; i < n_ops; i++) {
             struct profile_data prof;
 
             profile_start(ctx->profiler, &prof);
 
-            proc_op_req(octx, tens, i, &ops[i]);
+            proc_op_req(octx, tens, i, &ops[i], ctx->profiler ? &ovh : NULL);
 
             profile_stop(ctx->profiler, &prof);
 
@@ -854,6 +882,17 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
                     pds[i].pmu[j] = prof.pmu_counters[j];
                 }
             }
+        }
+
+        if (ctx->profiler) {
+            uint64_t batch_total_us = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - batch_t0);
+            uint64_t kernel_us = 0;
+            for (uint32_t i = 0; i < n_ops; i++) { kernel_us += pds[i].usecs; }
+            FARF(ALWAYS, "batch-overhead #%u: n-ops %u batch-total-us %u kernel-us %u "
+                 "l2flush-in-us %u l2flush-out-us %u l2flush-in-cnt %u l2flush-out-cnt %u l2flush-full-cnt %u",
+                 req.id, n_ops, (uint32_t) batch_total_us, (uint32_t) kernel_us,
+                 (uint32_t) ovh.l2flush_input_us, (uint32_t) ovh.l2flush_output_us,
+                 ovh.l2flush_input_count, ovh.l2flush_output_count, ovh.l2flush_full_count);
         }
 
         // dspqueue_write_early_wakeup_noblock(ctx->queue, 10, 0);
