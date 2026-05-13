@@ -435,6 +435,25 @@ static bool parse_bool_value(const std::string & value) {
 // CLI argument parsing functions
 //
 
+void common_params_handle_models(common_params & params, llama_example curr_ex) {
+    auto res = common_params_handle_model(params.model, params.hf_token, params.offline);
+    if (params.no_mmproj) {
+        params.mmproj = {};
+    } else if (res.found_mmproj && params.mmproj.path.empty() && params.mmproj.url.empty()) {
+        // optionally, handle mmproj model when -hf is specified
+        params.mmproj = res.mmproj;
+    }
+    // only download mmproj if the current example is using it
+    for (const auto & ex : mmproj_examples) {
+        if (curr_ex == ex) {
+            common_params_handle_model(params.mmproj,    params.hf_token, params.offline);
+            break;
+        }
+    }
+    common_params_handle_model(params.speculative.draft.mparams, params.hf_token, params.offline);
+    common_params_handle_model(params.vocoder.model,             params.hf_token, params.offline);
+}
+
 static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
     common_params & params = ctx_arg.params;
 
@@ -588,22 +607,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // handle model and download
     if (!skip_model_download) {
-        auto res = common_params_handle_model(params.model, params.hf_token, params.offline);
-        if (params.no_mmproj) {
-            params.mmproj = {};
-        } else if (res.found_mmproj && params.mmproj.path.empty() && params.mmproj.url.empty()) {
-            // optionally, handle mmproj model when -hf is specified
-            params.mmproj = res.mmproj;
-        }
-        // only download mmproj if the current example is using it
-        for (const auto & ex : mmproj_examples) {
-            if (ctx_arg.ex == ex) {
-                common_params_handle_model(params.mmproj,    params.hf_token, params.offline);
-                break;
-            }
-        }
-        common_params_handle_model(params.speculative.draft.mparams, params.hf_token, params.offline);
-        common_params_handle_model(params.vocoder.model,             params.hf_token, params.offline);
+        common_params_handle_models(params, ctx_arg.ex);
     }
 
     // model is required (except for server)
@@ -2219,7 +2223,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     if (llama_supports_rpc()) {
         add_opt(common_arg(
             {"--rpc"}, "SERVERS",
-            "comma separated list of RPC servers (host:port)",
+            "comma-separated list of RPC servers (host:port)",
             [](common_params & params, const std::string & value) {
                 add_rpc_devices(value);
                 GGML_UNUSED(params);
@@ -3551,7 +3555,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
     add_opt(common_arg(
         {"--spec-type"}, common_speculative_all_types_str(),
-        string_format("type of speculative decoding to use when no draft model is provided (default: %s)\n",
+        string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",
             common_speculative_type_name_str(params.speculative.types).c_str()),
         [](common_params & params, const std::string & value) {
             const auto enabled_types = string_split<std::string>(value, ',');
