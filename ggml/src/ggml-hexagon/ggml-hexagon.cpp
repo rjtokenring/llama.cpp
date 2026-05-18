@@ -2895,7 +2895,6 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
             switch (ggml_get_unary_op(t)) {
                 case GGML_UNARY_OP_SILU:     return HTP_OP_UNARY_SILU;
                 case GGML_UNARY_OP_GELU:     return HTP_OP_UNARY_GELU;
-                case GGML_UNARY_OP_TANH:     return HTP_OP_UNARY_TANH;
                 case GGML_UNARY_OP_SIGMOID:  return HTP_OP_UNARY_SIGMOID;
                 case GGML_UNARY_OP_NEG:      return HTP_OP_UNARY_NEG;
                 case GGML_UNARY_OP_EXP:      return HTP_OP_UNARY_EXP;
@@ -3391,9 +3390,6 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
                 case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_GELU:
                     supp = ggml_hexagon_supported_activations(sess, op);
-                    break;
-                case GGML_UNARY_OP_TANH:
-                    supp = ggml_hexagon_supported_unary(sess, op);
                     break;
                 default:
                     break;
