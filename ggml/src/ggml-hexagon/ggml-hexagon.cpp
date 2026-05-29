@@ -1625,6 +1625,17 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
             repack_mxfp4_mxfp4x4x2(tensor, data, size);
             break;
 
+        case GGML_TYPE_BF16: {
+            // Convert BF16 -> F16 during repack so the DSP can use the existing F16 matmul path
+            const ggml_bf16_t * src_bf16 = (const ggml_bf16_t *) data;
+            ggml_fp16_t *       dst_f16  = (ggml_fp16_t *) ((char *) tensor->data + offset);
+            const int64_t n = (int64_t)(size / sizeof(ggml_bf16_t));
+            for (int64_t i = 0; i < n; i++) {
+                dst_f16[i] = GGML_FP32_TO_FP16(GGML_BF16_TO_FP32(src_bf16[i]));
+            }
+            break;
+        }
+
         default:
             memcpy((char *) tensor->data + offset, data, size);
             break;
@@ -1903,6 +1914,10 @@ struct ggml_hexagon_opbatch {
         h.data  = t_offset;
         h.size  = t_size;
         h.type  = t->type;
+        // BF16 tensors in repack buffer have been converted to F16 by set_tensor
+        if (t->type == GGML_TYPE_BF16 && ggml_backend_buffer_is_hexagon_repack(t->buffer)) {
+            h.type = GGML_TYPE_F16;
+        }
         h.ne[0] = t->ne[0]; h.ne[1] = t->ne[1]; h.ne[2] = t->ne[2]; h.ne[3] = t->ne[3];
         h.nb[0] = t->nb[0]; h.nb[1] = t->nb[1]; h.nb[2] = t->nb[2]; h.nb[3] = t->nb[3];
 
@@ -2604,6 +2619,20 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
             }
             if (ggml_nrows(src1) > 1024) {
                 return false;  // no huge batches (for now)
+            }
+            break;
+
+        case GGML_TYPE_BF16:
+            // BF16 is converted to F16 during repack, then uses the F16 matmul path
+            if (src0->nb[1] < src0->nb[0]) {
+                return false;
+            }
+            if (ggml_nrows(src1) > 1024) {
+                return false;
+            }
+            // Must be in repack buffer (where bf16->f16 conversion happens)
+            if (src0->buffer && !ggml_backend_buffer_is_hexagon_repack(src0->buffer)) {
+                return false;
             }
             break;
 
