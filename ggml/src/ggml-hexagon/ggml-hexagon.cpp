@@ -2871,8 +2871,12 @@ static bool ggml_hexagon_supported_get_rows(const struct ggml_hexagon_session * 
     const struct ggml_tensor * src1 = op->src[1]; // indices
     const struct ggml_tensor * dst  = op;
 
-    if (src0->type != GGML_TYPE_F32) {
-        return false;
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_Q4_0:
+            break;
+        default:
+            return false;
     }
 
     if (src1->type != GGML_TYPE_I32 && src1->type != GGML_TYPE_I64) {
