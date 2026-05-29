@@ -66,7 +66,7 @@ static u32vec opt_pmu_evt { 0x3, 0x111, 0x100, 0x105, 0x240, 0x256, 0x7D, 0x8C }
 
 // Enable all stages by default
 static int opt_opstage  = HTP_OPSTAGE_QUEUE | HTP_OPSTAGE_COMPUTE;
-static int opt_opbatch  = 1024; // max number of ops in a batch
+static int opt_opbatch  = 2048; // max number of ops in a batch
 static int opt_opqueue  = 16;   // max number of pending batches
 static int opt_oppoll   = 0;    // polling for batch completions
 
@@ -2581,10 +2581,6 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
         case GGML_TYPE_MXFP4:
             if (src0->ne[0] % 32) {
                 return false;
-            }
-
-            if (ggml_nrows(src0) > 16 * 1024) {
-                return false;  // typically the lm-head which would be too large for VTCM
             }
 
             if (ggml_nrows(src1) > 1024 || src1->ne[2] != 1 || src1->ne[3] != 1) {
