@@ -1794,6 +1794,8 @@ static ggml_backend_buffer_type_i ggml_backend_hexagon_repack_buffer_type_interf
     /* .is_host          = */ ggml_backend_hexagon_repack_buffer_type_is_host,
 };
 
+static inline bool ggml_backend_buffer_is_hexagon_repack(const struct ggml_backend_buffer * b);
+
 struct ggml_hexagon_opbatch {
     ggml_hexagon_session*            sess;
 
