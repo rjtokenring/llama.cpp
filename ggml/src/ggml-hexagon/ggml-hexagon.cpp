@@ -1626,11 +1626,14 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
             break;
 
         case GGML_TYPE_BF16: {
-            // Convert BF16 -> F16 during repack so the DSP can use the existing F16 matmul path
+            GGML_ASSERT(offset == 0);
+            GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
+            // Convert BF16 -> F16 in place so the DSP can use the existing F16 matmul path.
+            // Storage size matches (both 2 bytes/element), so the tensor buffer is reused.
             const ggml_bf16_t * src_bf16 = (const ggml_bf16_t *) data;
             ggml_fp16_t *       dst_f16  = (ggml_fp16_t *) ((char *) tensor->data + offset);
-            const int64_t n = (int64_t)(size / sizeof(ggml_bf16_t));
-            for (int64_t i = 0; i < n; i++) {
+            const size_t n = size / sizeof(ggml_bf16_t);
+            for (size_t i = 0; i < n; i++) {
                 dst_f16[i] = GGML_FP32_TO_FP16(GGML_BF16_TO_FP32(src_bf16[i]));
             }
             break;
@@ -1682,6 +1685,19 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
             GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
             repack_mxfp4x4x2_mxfp4(data, tensor, size);
             break;
+
+        case GGML_TYPE_BF16: {
+            GGML_ASSERT(offset == 0);
+            GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
+            // Storage was converted to F16 by set_tensor; convert back to BF16 on read.
+            const ggml_fp16_t * src_f16  = (const ggml_fp16_t *) ((const char *) tensor->data + offset);
+            ggml_bf16_t *       dst_bf16 = (ggml_bf16_t *) data;
+            const size_t n = size / sizeof(ggml_bf16_t);
+            for (size_t i = 0; i < n; i++) {
+                dst_bf16[i] = GGML_FP32_TO_BF16(GGML_FP16_TO_FP32(src_f16[i]));
+            }
+            break;
+        }
 
         default:
             memcpy(data, (const char *) tensor->data + offset, size);
@@ -1794,7 +1810,24 @@ static ggml_backend_buffer_type_i ggml_backend_hexagon_repack_buffer_type_interf
     /* .is_host          = */ ggml_backend_hexagon_repack_buffer_type_is_host,
 };
 
-static inline bool ggml_backend_buffer_is_hexagon_repack(const struct ggml_backend_buffer * b);
+static bool ggml_backend_buffer_is_hexagon(const struct ggml_backend_buffer * b) {
+    return b->buft->iface.get_alignment == ggml_backend_hexagon_buffer_type_get_alignment;
+}
+
+static inline bool ggml_backend_buffer_is_hexagon_repack(const struct ggml_backend_buffer * b) {
+    if (!opt_hostbuf) {
+        return ggml_backend_buffer_is_hexagon(b);
+    }
+    return b->buft->iface.alloc_buffer == ggml_backend_hexagon_repack_buffer_type_alloc_buffer;
+}
+
+// BF16 weights in a repack buffer are converted to F16 on set_tensor; the DSP sees them as F16.
+static inline ggml_type ggml_hexagon_effective_tensor_type(const ggml_tensor * t) {
+    if (t->type == GGML_TYPE_BF16 && t->buffer && ggml_backend_buffer_is_hexagon_repack(t->buffer)) {
+        return GGML_TYPE_F16;
+    }
+    return t->type;
+}
 
 struct ggml_hexagon_opbatch {
     ggml_hexagon_session*            sess;
@@ -1915,11 +1948,7 @@ struct ggml_hexagon_opbatch {
         h.bi    = add_buffer(sbuf);
         h.data  = t_offset;
         h.size  = t_size;
-        h.type  = t->type;
-        // BF16 tensors in repack buffer have been converted to F16 by set_tensor
-        if (t->type == GGML_TYPE_BF16 && ggml_backend_buffer_is_hexagon_repack(t->buffer)) {
-            h.type = GGML_TYPE_F16;
-        }
+        h.type  = ggml_hexagon_effective_tensor_type(t);
         h.ne[0] = t->ne[0]; h.ne[1] = t->ne[1]; h.ne[2] = t->ne[2]; h.ne[3] = t->ne[3];
         h.nb[0] = t->nb[0]; h.nb[1] = t->nb[1]; h.nb[2] = t->nb[2]; h.nb[3] = t->nb[3];
 
@@ -2480,17 +2509,6 @@ ggml_hexagon_session::~ggml_hexagon_session() noexcept(true) {
 
 // ** backend interface
 
-static bool ggml_backend_buffer_is_hexagon(const struct ggml_backend_buffer * b) {
-    return b->buft->iface.get_alignment == ggml_backend_hexagon_buffer_type_get_alignment;
-}
-
-static inline bool ggml_backend_buffer_is_hexagon_repack(const struct ggml_backend_buffer * b) {
-    if (!opt_hostbuf) {
-        return ggml_backend_buffer_is_hexagon(b);
-    }
-    return b->buft->iface.alloc_buffer == ggml_backend_hexagon_repack_buffer_type_alloc_buffer;
-}
-
 static bool ggml_hexagon_supported_flash_attn_ext(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
@@ -2647,14 +2665,20 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
             break;
 
         case GGML_TYPE_BF16:
-            // BF16 is converted to F16 during repack, then uses the F16 matmul path
+            // BF16 weights are converted to F16 during set_tensor, then dispatched via the F16 matmul path.
+            // Mirror the F16 branch constraints below.
             if (src0->nb[1] < src0->nb[0]) {
+                GGML_LOG_DEBUG("ggml_hexagon_supported_mul_mat: permuted BF16 src0 not supported\n");
+                return false;
+            }
+            if (src1->ne[2] < src0->ne[2] || src1->ne[3] < src0->ne[3]) {
+                GGML_LOG_DEBUG("ggml_hexagon_supported_mul_mat: src1 broadcasting not supported\n");
                 return false;
             }
             if (ggml_nrows(src1) > 1024) {
                 return false;
             }
-            // Must be in repack buffer (where bf16->f16 conversion happens)
+            // Must be in a repack buffer (that is where the BF16 -> F16 conversion happens).
             if (src0->buffer && !ggml_backend_buffer_is_hexagon_repack(src0->buffer)) {
                 return false;
             }
