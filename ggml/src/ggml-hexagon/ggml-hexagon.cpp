@@ -3030,6 +3030,60 @@ static bool ggml_hexagon_supported_pad(const struct ggml_hexagon_session * sess,
     return true;
 }
 
+static bool ggml_hexagon_supported_pool_2d(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * dst  = op;
+
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    const int32_t * opts = (const int32_t *) op->op_params;
+    const int32_t  pool_op = opts[0];
+
+    // initial scope: only POOL_AVG (used by Gemma4VisionPooler)
+    if (pool_op != GGML_OP_POOL_AVG) {
+        return false;
+    }
+
+    GGML_UNUSED(sess);
+    return true;
+}
+
+static bool ggml_hexagon_supported_im2col(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    const struct ggml_tensor * src0 = op->src[0]; // kernel
+    const struct ggml_tensor * src1 = op->src[1]; // image
+    const struct ggml_tensor * dst  = op;
+
+    // initial scope: F16 kernel + F32/F16 image, F16 dst, 2D im2col
+    if (src0->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (dst->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    const int32_t * opts = (const int32_t *) op->op_params;
+    const bool is_2D = opts[6] == 1;
+    if (!is_2D) {
+        return false;
+    }
+
+    if (!ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    GGML_UNUSED(sess);
+    return true;
+}
+
 static bool ggml_hexagon_supported_cumsum(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * dst  = op;
@@ -3151,6 +3205,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_SCALE:           return HTP_OP_SCALE;
         case GGML_OP_SQR:             return HTP_OP_SQR;
         case GGML_OP_SQRT:            return HTP_OP_SQRT;
+        case GGML_OP_CLAMP:           return HTP_OP_CLAMP;
         case GGML_OP_SOFT_MAX:        return HTP_OP_SOFTMAX;
         case GGML_OP_SSM_CONV:        return HTP_OP_SSM_CONV;
         case GGML_OP_GATED_DELTA_NET: return HTP_OP_GATED_DELTA_NET;
@@ -3162,6 +3217,8 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_SOLVE_TRI:       return HTP_OP_SOLVE_TRI;
         case GGML_OP_TRI:             return HTP_OP_TRI;
         case GGML_OP_PAD:             return HTP_OP_PAD;
+        case GGML_OP_POOL_2D:         return HTP_OP_POOL_2D;
+        case GGML_OP_IM2COL:          return HTP_OP_IM2COL;
 
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(t)) {
@@ -3632,6 +3689,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
+        case GGML_OP_CLAMP:
             supp = ggml_hexagon_supported_unary(sess, op);
             break;
 
@@ -3740,6 +3798,14 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_PAD:
             supp = ggml_hexagon_supported_pad(sess, op);
+            break;
+
+        case GGML_OP_POOL_2D:
+            supp = ggml_hexagon_supported_pool_2d(sess, op);
+            break;
+
+        case GGML_OP_IM2COL:
+            supp = ggml_hexagon_supported_im2col(sess, op);
             break;
 
         default:

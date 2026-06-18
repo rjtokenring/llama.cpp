@@ -77,6 +77,8 @@ target_sources(${HTP_LIB} PRIVATE
     solve-tri-ops.c
     gated-delta-net-ops.c
     pad-ops.c
+    pool-ops.c
+    im2col-ops.c
 )
 
 set_target_properties(${HTP_LIB} PROPERTIES EXPORT_COMPILE_COMMANDS ON)

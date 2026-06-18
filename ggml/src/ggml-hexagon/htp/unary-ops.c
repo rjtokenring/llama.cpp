@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "hex-dma.h"
+#include "hvx-clamp.h"
 #include "hvx-exp.h"
 #include "hvx-sigmoid.h"
 #include "hvx-utils.h"
@@ -318,6 +319,26 @@ static void scale_f32(const float * restrict src,
         uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * row_size);
 
         hvx_scale_offset_f32_aa((uint8_t *) dst_local, (const uint8_t *) src_local, row_elems, scale, bias);
+    }
+}
+
+static void clamp_f32(const float * restrict src,
+                      float * restrict dst,
+                      uint8_t * restrict spad,
+                      const uint32_t num_rows,
+                      const uint32_t row_elems,
+                      const size_t   row_size,
+                      int32_t *      op_params) {
+    float min = 0.f;
+    float max = 0.f;
+    memcpy(&min, &op_params[0], sizeof(float));
+    memcpy(&max, &op_params[1], sizeof(float));
+
+    for (uint32_t ir = 0; ir < num_rows; ir++) {
+        const uint8_t * restrict src_local = (const uint8_t *)src + (ir * row_size);
+        uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * row_size);
+
+        hvx_clamp_f32_aa((uint8_t *) dst_local, (const uint8_t *) src_local, row_elems, min, max);
     }
 }
 
@@ -779,6 +800,9 @@ static void unary_job_f32_per_thread(unsigned int nth, unsigned int ith, void * 
             case HTP_OP_SCALE:
                 scale_f32(src0_spad, dst_spad, NULL, block_size, ne0, src0_row_size_aligned, op_params);
                 break;
+            case HTP_OP_CLAMP:
+                clamp_f32(src0_spad, dst_spad, NULL, block_size, ne0, src0_row_size_aligned, op_params);
+                break;
             case HTP_OP_SQR:
                 sqr_f32(src0_spad, dst_spad, NULL, block_size, ne0, src0_row_size_aligned, op_params);
                 break;
@@ -867,6 +891,9 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
             break;
         case HTP_OP_SCALE:
             op_type = "scale-f32";
+            break;
+        case HTP_OP_CLAMP:
+            op_type = "clamp-f32";
             break;
         case HTP_OP_SQR:
             op_type = "sqr-f32";
