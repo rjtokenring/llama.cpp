@@ -2710,8 +2710,8 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
                 return false;
             }
 
-            if (ggml_nrows(src0) > 16 * 1024) {
-                return false;  // typically the lm-head which would be too large for VTCM
+            if (ggml_nrows(src0) > 512 * 1024) {
+                return false;  // src0 rows stream through VTCM in tiles; cap kept high enough for large lm-heads (e.g. Gemma E4B vocab)
             }
 
             if (ggml_nrows(src1) > 1024 || src1->ne[2] != 1 || src1->ne[3] != 1) {
