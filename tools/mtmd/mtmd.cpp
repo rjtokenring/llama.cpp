@@ -251,6 +251,8 @@ mtmd_context_params mtmd_context_params_default() {
         /* cb_eval           */ nullptr,
         /* cb_eval_user_data */ nullptr,
         /* batch_max_tokens  */ 1024,
+        /* progress_callback */ nullptr,
+        /* progress_callback_user_data */ nullptr,
     };
     return params;
 }
@@ -345,6 +347,8 @@ struct mtmd_context {
             /* cb_eval           */ ctx_params.cb_eval,
             /* cb_eval_user_data */ ctx_params.cb_eval_user_data,
             /* no_alloc          */ no_alloc,
+            /* progress_callback */ ctx_params.progress_callback,
+            /* progress_callback_user_data */ ctx_params.progress_callback_user_data,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);
@@ -614,15 +618,10 @@ struct mtmd_context {
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
                 } break;
             case PROJECTOR_TYPE_DEEPSEEKOCR:
-                {
-                    img_end = "\n"; // prevent empty batch on llama-server
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseekocr>(ctx_v);
-                    ov_img_first = false;
-                } break;
             case PROJECTOR_TYPE_DEEPSEEKOCR2:
                 {
                     img_end = "\n"; // prevent empty batch on llama-server
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseekocr2>(ctx_v);
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseekocr>(ctx_v);
                     ov_img_first = false;
                 } break;
             case PROJECTOR_TYPE_HUNYUANVL:
@@ -810,7 +809,7 @@ void mtmd_free(mtmd_context * ctx) {
 struct mtmd_tokenizer {
     mtmd_context * ctx;
 
-    std::string input_text;
+    std::string input_text; // note: can contain null bytes; do not use c_str()
     bool add_special;
     bool parse_special;
     const llama_vocab * vocab;
@@ -840,8 +839,9 @@ struct mtmd_tokenizer {
             size_t n_bitmaps) : ctx(ctx) {
         add_special   = text->add_special;
         parse_special = text->parse_special;
-        input_text    = text->text;
         vocab         = ctx->vocab;
+
+        input_text.assign(text->text, text->text_len);
 
         std::vector<const mtmd_bitmap *> bitmaps(bmps, bmps + n_bitmaps);
         auto parts_str = split_text(input_text, ctx->media_marker);
@@ -1128,6 +1128,7 @@ struct mtmd_tokenizer {
 
                 // add slices (or tiles)
                 if (!chunks.empty()) {
+                    LOG_DBG("%s: adding %d slices (%d rows x %d cols)\n", __func__, (int)chunks.size(), n_row, n_col);
                     GGML_ASSERT((int)chunks.size() == n_row * n_col);
                     add_text(ctx->tok_slices_start);
                     for (int y = 0; y < n_row; y++) {
@@ -1170,7 +1171,6 @@ struct mtmd_tokenizer {
                     cur.entries.emplace_back(std::move(ov_chunk));
                     add_text(ctx->tok_ov_img_end);
                 }
-
             } else {
 
                 if (preproc_out.entries.size() == 0) {
@@ -1295,9 +1295,12 @@ struct mtmd_tokenizer {
             for (auto & mel_spec : mel_spec_chunks) {
                 const bool is_placeholder = mel_spec.data.empty();
 
+                // Validate dimensions fit in clip_image_size (int)
+                GGML_ASSERT(mel_spec.n_len <= INT32_MAX && mel_spec.n_len >= 0);
+                GGML_ASSERT(mel_spec.n_mel <= INT32_MAX && mel_spec.n_mel >= 0);
                 clip_image_f32 mel_f32;
                 mel_f32.set_size(
-                    {mel_spec.n_len, mel_spec.n_mel},
+                    {(int)mel_spec.n_len, (int)mel_spec.n_mel},
                     is_placeholder, /* is_audio */ true);
                 mel_f32.cpy_buf(mel_spec.data);
 
@@ -2130,9 +2133,12 @@ std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(const char * mmproj_f
     mtmd::context_ptr ctx;
     auto saved_log_callback = g_logger_state.log_callback;
     auto saved_log_user_data = g_logger_state.log_callback_user_data;
+
+    ctx_params.progress_callback = nullptr;
+
     try {
         mtmd_log_set(stub_log_callback, nullptr); // suppress logging
-        ctx.reset(new mtmd_context(mmproj_fname, nullptr, ctx_params));
+        ctx.reset(new mtmd_context(mmproj_fname, nullptr, ctx_params, true));
         mtmd_log_set(saved_log_callback, saved_log_user_data); // restore log callback
         std::map<ggml_backend_dev_t, size_t> total_mem;
         auto merge = [&](const struct clip_ctx * c) {
