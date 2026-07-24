@@ -213,6 +213,19 @@ static inline bool ggml_hexagon_is_repack_type(enum ggml_type type) {
            type == GGML_TYPE_MXFP4;
 }
 
+// Type actually stored inside a hexagon repack buffer for a given weight type.
+// Some types are converted at set_tensor time so the DSP can reuse an existing matmul path:
+//   BF16 -> F16 (same 2-byte storage), Q6_K -> Q8_0 (larger, tiled; used for the lm-head).
+// Single source of truth for these mappings (see ggml_hexagon_effective_tensor_type,
+// get_alloc_size and the set_tensor/get_tensor conversions).
+static inline ggml_type ggml_hexagon_repack_storage_type(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_BF16: return GGML_TYPE_F16;
+        case GGML_TYPE_Q6_K: return GGML_TYPE_Q8_0;
+        default:             return type;
+    }
+}
+
 static inline bool ggml_hexagon_is_hmx_weight_type(enum ggml_type type) {
     return type == GGML_TYPE_F16 || type == GGML_TYPE_F32 || ggml_hexagon_is_repack_type(type);
 }
@@ -1168,6 +1181,8 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
             GGML_ASSERT(offset == 0);
             GGML_ASSERT(offset + size <= ggml_nbytes(tensor));  // size is the Q6_K data size
             // Storage was converted to Q8_0 (tiled) by set_tensor; reconstruct Q6_K on read.
+            // Not exercised during inference (the lm-head weight is only consumed on the DSP), but
+            // kept for symmetry with the other repack types so a stray read-back cannot corrupt data.
             repack_tiled_q8_0_to_q6_K(data, tensor, size);
             break;
 
@@ -1247,20 +1262,15 @@ static size_t ggml_backend_hexagon_buffer_type_get_alignment(ggml_backend_buffer
 }
 
 static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * t) {
-    if (t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q4_1 || t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_IQ4_NL || t->type == GGML_TYPE_MXFP4) {
+    // Repacked quantized weights are stored padded to 32 in the tiled layout of their storage type
+    // (Q6_K is stored as Q8_0 - see ggml_hexagon_repack_storage_type).
+    const ggml_type stype = ggml_hexagon_repack_storage_type(t->type);
+    if (ggml_hexagon_is_repack_type(stype)) {
         int64_t ne0 = hex_round_up(t->ne[0], 32);
         int64_t ne1 = hex_round_up(t->ne[1], 32);
         int64_t ne2 = t->ne[2];
         int64_t ne3 = t->ne[3];
-        return ggml_row_size(t->type, ne0) * ne1 * ne2 * ne3;
-    }
-    if (t->type == GGML_TYPE_Q6_K) {
-        // Q6_K weights are converted to Q8_0 (tiled) on set_tensor; reserve the Q8_0-tiled size.
-        int64_t ne0 = hex_round_up(t->ne[0], 32);
-        int64_t ne1 = hex_round_up(t->ne[1], 32);
-        int64_t ne2 = t->ne[2];
-        int64_t ne3 = t->ne[3];
-        return ggml_row_size(GGML_TYPE_Q8_0, ne0) * ne1 * ne2 * ne3;
+        return ggml_row_size(stype, ne0) * ne1 * ne2 * ne3;
     }
     return ggml_nbytes(t);
 
@@ -1313,18 +1323,11 @@ static inline bool ggml_backend_buffer_is_hexagon_repack(const struct ggml_backe
     return b->buft->iface.alloc_buffer == ggml_backend_hexagon_repack_buffer_type_alloc_buffer;
 }
 
-// Some weights are converted to a different type on set_tensor when placed in a repack buffer;
-// the DSP sees them as the converted (effective) type:
-//   - BF16 -> F16 (same storage size, F16 matmul path)
-//   - Q6_K -> Q8_0 (larger storage, reuses the Q8_0 repacked matmul path; used for the lm-head)
+// Weights in a repack buffer are converted on set_tensor (see ggml_hexagon_repack_storage_type);
+// the DSP sees them as the converted (effective) type. Outside a repack buffer the type is unchanged.
 static inline ggml_type ggml_hexagon_effective_tensor_type(const ggml_tensor * t) {
     if (t->buffer && ggml_backend_buffer_is_hexagon_repack(t->buffer)) {
-        if (t->type == GGML_TYPE_BF16) {
-            return GGML_TYPE_F16;
-        }
-        if (t->type == GGML_TYPE_Q6_K) {
-            return GGML_TYPE_Q8_0;
-        }
+        return ggml_hexagon_repack_storage_type(t->type);
     }
     return t->type;
 }
