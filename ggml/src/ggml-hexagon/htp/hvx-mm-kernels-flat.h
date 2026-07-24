@@ -256,6 +256,16 @@ static inline void quantize_f16_f16_flat_kernel(
 
 // Dot kernels that consume flat (non-tiled) activations
 
+// TODO(q6_k): PLACEHOLDER STUBS (write zeros / src2 bias). See the note in hvx-mm-kernels-tiled.h.
+static void flat_vec_dot_q6_k_32x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy, uint32_t valid_rows, const float * restrict sz) {
+    for (uint32_t i = 0; i < valid_rows; i++) { s[i] = sz ? sz[i] : 0.0f; }
+    (void) n; (void) vx; (void) vy;
+}
+static void flat_vec_dot_q6_k_32x2(const uint32_t n, float * restrict s0, float * restrict s1, const void * restrict vx, const void * restrict vy0, const void * restrict vy1, uint32_t valid_rows, const float * restrict sz0, const float * restrict sz1) {
+    for (uint32_t i = 0; i < valid_rows; i++) { s0[i] = sz0 ? sz0[i] : 0.0f; s1[i] = sz1 ? sz1[i] : 0.0f; }
+    (void) n; (void) vx; (void) vy0; (void) vy1;
+}
+
 static void flat_vec_dot_q4_0_32x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy, uint32_t valid_rows, const float * restrict sz) {
     const uint8_t * restrict tile_ptr = vx;
     const uint8_t * restrict y_q = vy;

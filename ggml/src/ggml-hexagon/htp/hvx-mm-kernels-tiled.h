@@ -378,6 +378,19 @@ static inline HVX_VectorPair accum_q8_0_32x2(
     return Q6_W_vcombine_VV(v_sum1, v_sum0);
 }
 
+// TODO(q6_k): PLACEHOLDER STUBS. These write zeros (or the src2 bias) instead of the real dot
+// product; the model output will be wrong until the real HVX Q6_K kernel lands (phase 2). They
+// exist so the native Q6_K path compiles and the structural wiring (placement, sizes, repack,
+// dispatch) can be validated on device first. See repack_q6_K_tiled for the tile layout.
+static void tiled_vec_dot_q6_k_32x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy, uint32_t valid_rows, const float * restrict sz) {
+    for (uint32_t i = 0; i < valid_rows; i++) { s[i] = sz ? sz[i] : 0.0f; }
+    (void) n; (void) vx; (void) vy;
+}
+static void tiled_vec_dot_q6_k_32x2(const uint32_t n, float * restrict s0, float * restrict s1, const void * restrict vx, const void * restrict vy0, const void * restrict vy1, uint32_t valid_rows, const float * restrict sz0, const float * restrict sz1) {
+    for (uint32_t i = 0; i < valid_rows; i++) { s0[i] = sz0 ? sz0[i] : 0.0f; s1[i] = sz1 ? sz1[i] : 0.0f; }
+    (void) n; (void) vx; (void) vy0; (void) vy1;
+}
+
 static void tiled_vec_dot_q4_0_32x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy, uint32_t valid_rows, const float * restrict sz) {
     const uint8_t * restrict tile_ptr = vx;
     const uint8_t * restrict y_q = vy;

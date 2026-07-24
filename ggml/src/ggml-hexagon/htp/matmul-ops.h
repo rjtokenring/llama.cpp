@@ -25,6 +25,15 @@ extern "C" {
 #define HTP_MM_WEIGHT_TILE_SIZE_Q8_0   1088
 #define HTP_MM_WEIGHT_TILE_SIZE_IQ4_NL 576
 #define HTP_MM_WEIGHT_TILE_SIZE_MXFP4  544
+// Q6_K tile for a 32-row x 32-k block (native 6-bit, no expansion to Q8_0):
+//   ql (low 4 bits)    : 32*32/2                     = 512 bytes
+//   qh (high 2 bits)   : 32*32/4                     = 256 bytes
+//   eff scales (fp16)  : 2 sub-blocks(16) * 32 rows * 2 = 128 bytes  (= d_q6 * scales[s16])
+// total = 896 bytes (7 bits/element, ~= native 6.5625 + small scale overhead; ~3x smaller than
+// the Q8_0 repack). The per-16 int8 sub-scale and the per-256 fp16 super-scale (d_q6) are folded
+// into one fp16 "effective scale" at repack time, so the kernel only multiplies by eff_scale
+// (per 16) and the Q8_0 activation scale (per 32).
+#define HTP_MM_WEIGHT_TILE_SIZE_Q6_K   896
 
 // --- Weight Repacked Aligned Tile Sizes ---
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0   640
@@ -32,6 +41,7 @@ extern "C" {
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q8_0   1152
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_IQ4_NL 640
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_MXFP4  640
+#define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q6_K   896
 
 // --- Activation Tiled Block Sizes (including padding) ---
 #define HTP_MM_ACT_TILE_SIZE_Q8_0      1152
@@ -196,6 +206,8 @@ static inline uint32_t htp_mm_get_weight_tile_size(int weight_type) {
             return HTP_MM_WEIGHT_TILE_SIZE_Q4_1;
         case HTP_TYPE_Q8_0:
             return HTP_MM_WEIGHT_TILE_SIZE_Q8_0;
+        case HTP_TYPE_Q6_K:
+            return HTP_MM_WEIGHT_TILE_SIZE_Q6_K;
         case HTP_TYPE_MXFP4:
             return HTP_MM_WEIGHT_TILE_SIZE_MXFP4;
         default:
@@ -212,6 +224,8 @@ static inline uint32_t htp_mm_get_weight_aligned_tile_size(int weight_type) {
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_1;
         case HTP_TYPE_Q8_0:
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q8_0;
+        case HTP_TYPE_Q6_K:
+            return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q6_K;
         case HTP_TYPE_MXFP4:
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_MXFP4;
         default:
@@ -253,6 +267,7 @@ static inline size_t htp_mm_get_tiled_row_stride(int weight_type, uint32_t k) {
         case HTP_TYPE_IQ4_NL:
         case HTP_TYPE_Q4_1:
         case HTP_TYPE_Q8_0:
+        case HTP_TYPE_Q6_K:
         case HTP_TYPE_MXFP4:
             return (size_t) nb * htp_mm_get_weight_tile_size(weight_type);
         case HTP_TYPE_F16:
@@ -474,7 +489,7 @@ static inline void htp_mm_hvx_vtcm_layout_build(
 
     const bool is_repack = (wtype == HTP_TYPE_Q4_0 || wtype == HTP_TYPE_Q4_1 ||
                             wtype == HTP_TYPE_Q8_0 || wtype == HTP_TYPE_IQ4_NL ||
-                            wtype == HTP_TYPE_MXFP4);
+                            wtype == HTP_TYPE_MXFP4 || wtype == HTP_TYPE_Q6_K);
 
     if (is_fused_qkv || is_fused_ffn) {
         const size_t src0_row_size_padded = hex_round_up(src0_row_size, 128);

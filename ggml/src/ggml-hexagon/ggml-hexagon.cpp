@@ -210,23 +210,35 @@ static void ggml_hexagon_dump_trace_events(const std::string & sess_name, const 
 static inline bool ggml_hexagon_is_repack_type(enum ggml_type type) {
     return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 ||
            type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL ||
-           type == GGML_TYPE_MXFP4;
+           type == GGML_TYPE_MXFP4 || type == GGML_TYPE_Q6_K;
 }
 
 // Type actually stored inside a hexagon repack buffer for a given weight type.
-// Some types are converted at set_tensor time so the DSP can reuse an existing matmul path:
-//   BF16 -> F16 (same 2-byte storage), Q6_K -> Q8_0 (larger, tiled; used for the lm-head).
+// BF16 is converted to F16 at set_tensor time (same 2-byte storage, reuses the F16 matmul path).
+// Q6_K is repacked natively into its own 6-bit tiled layout (kept compact; see repack_q6_K_tiled).
 // Single source of truth for these mappings (see ggml_hexagon_effective_tensor_type,
 // get_alloc_size and the set_tensor/get_tensor conversions).
 static inline ggml_type ggml_hexagon_repack_storage_type(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_BF16: return GGML_TYPE_F16;
-        case GGML_TYPE_Q6_K: return GGML_TYPE_Q8_0;
         default:             return type;
     }
 }
 
+// Per-row byte size of a repacked weight in the DSP tiled layout: (ne0/32) k-tiles times
+// (tile_size/32) bytes per row per tile. ne0 must already be padded to 32. This matches
+// ggml_row_size() for the flat repack types (Q4_0/Q4_1/Q8_0/IQ4_NL/MXFP4) and is the correct
+// value for Q6_K, whose 6-bit tiled layout differs from its ggml row size.
+static inline size_t ggml_hexagon_tiled_row_size(enum ggml_type stype, int64_t ne0_padded) {
+    return (size_t) (ne0_padded / 32) * (htp_mm_get_weight_tile_size(stype) / 32);
+}
+
 static inline bool ggml_hexagon_is_hmx_weight_type(enum ggml_type type) {
+    // Q6_K is a repack type but its per-16 sub-block scaling does not map onto the HMX matrix
+    // engine, so it stays HVX-only.
+    if (type == GGML_TYPE_Q6_K) {
+        return false;
+    }
     return type == GGML_TYPE_F16 || type == GGML_TYPE_F32 || ggml_hexagon_is_repack_type(type);
 }
 
@@ -834,11 +846,37 @@ static void repack_tiled_q8_0(void * data, const ggml_tensor * t, size_t size) {
     GGML_UNUSED(size);
 }
 
-// Convert a Q6_K weight into the Q8_0 tiled layout expected by the DSP matmul kernel.
-// Q6_K blocks are dequantized to f32 then requantized to Q8_0 (near-lossless), and the
-// resulting Q8_0 blocks are scattered into the same tiled layout produced by repack_q8_0_tiled.
-// Used to run the lm-head (token_embd / output weight) on the DSP.
-static void repack_q6_K_to_q8_0_tiled(ggml_tensor * t, const void * data, size_t size) {
+// --- Native Q6_K tiled layout (32 rows x 32 k per tile, 896 bytes) ---
+//   ql plane [0..511]   : row*16 + (k/2)          -> lo4(k even) | (lo4(k odd) << 4)
+//   qh plane [512..767] : row*8  + (k/4), shift (k%4)*2 -> hi2 (0..3)
+//   scales   [768..895] : (row*2 + k/16) fp16     -> eff_scale = d_q6 * scales[sub16]
+// The per-16 int8 sub-scale and the per-256 fp16 super-scale are folded into one fp16 eff_scale.
+#define HEX_Q6K_TILE_QL_OFF     0
+#define HEX_Q6K_TILE_QH_OFF     512
+#define HEX_Q6K_TILE_SCALE_OFF  768
+
+// Reconstruct the unsigned 6-bit value (0..63) for logical element e (0..QK_K-1) of a Q6_K block,
+// mirroring dequantize_row_q6_K (without the -32 bias / float scale).
+static inline uint8_t hex_q6k_get(const block_q6_K * b, int e) {
+    const int c = e / 128;      // 128-element chunk (0 or 1)
+    const int w = e % 128;
+    const int g = w / 32;       // group 0..3
+    const int l = w % 32;
+    const uint8_t * ql = b->ql + c * 64;
+    const uint8_t * qh = b->qh + c * 32;
+    uint8_t lo, hi;
+    switch (g) {
+        case 0:  lo = ql[l]      & 0xF; hi = (qh[l] >> 0) & 3; break;
+        case 1:  lo = ql[l + 32] & 0xF; hi = (qh[l] >> 2) & 3; break;
+        case 2:  lo = ql[l]      >> 4;  hi = (qh[l] >> 4) & 3; break;
+        default: lo = ql[l + 32] >> 4;  hi = (qh[l] >> 6) & 3; break;
+    }
+    return (uint8_t) (lo | (hi << 4));
+}
+
+// Repack a Q6_K weight natively into the DSP 6-bit tiled layout (no expansion to Q8_0).
+// Used to run the lm-head (token_embd / output weight) on the DSP with ~3x less memory/DMA.
+static void repack_q6_K_tiled(ggml_tensor * t, const void * data, size_t size) {
     const block_q6_K * src_matrix = (const block_q6_K *) data;
     int64_t ne0 = t->ne[0];
     int64_t ne1 = t->ne[1];
@@ -851,40 +889,47 @@ static void repack_q6_K_to_q8_0_tiled(ggml_tensor * t, const void * data, size_t
 
     const int n_col_tiles = ne1_padded / 32;
     const int n_k_tiles   = ne0_padded / 32;
-    const size_t tile_size   = HTP_MM_WEIGHT_TILE_SIZE_Q8_0;
+    const size_t tile_size   = HTP_MM_WEIGHT_TILE_SIZE_Q6_K;
     const size_t matrix_size = (size_t) n_col_tiles * n_k_tiles * tile_size;
 
-    const int64_t q6k_blocks_per_row = ne0 / QK_K;  // Q6_K blocks per row
-    const int64_t q8_blocks_per_row  = ne0 / QK8_0;  // Q8_0 blocks per row (== n_k_tiles when ne0 % 32 == 0)
-
-    // Per-row scratch: dequantized floats + requantized Q8_0 blocks.
-    std::vector<float>      row_f32(ne0);
-    std::vector<block_q8_0> row_q8(q8_blocks_per_row);
+    const int64_t sb_per_row = ne0 / QK_K;  // Q6_K super-blocks per row
 
     for (int i3 = 0; i3 < ne3; i3++) {
         for (int i2 = 0; i2 < ne2; i2++) {
-            const block_q6_K * src_expert = src_matrix + (i3 * ne2 + i2) * (ne1 * q6k_blocks_per_row);
+            const block_q6_K * src_expert = src_matrix + (i3 * ne2 + i2) * (ne1 * sb_per_row);
             uint8_t * matrix_dst = (uint8_t *) t->data + (i3 * ne2 + i2) * matrix_size;
 
-            // Zero-fill so padding rows/tiles are well-defined.
-            memset(matrix_dst, 0, matrix_size);
+            memset(matrix_dst, 0, matrix_size);  // well-defined padding rows/tiles
 
             for (int64_t r = 0; r < ne1; r++) {
-                dequantize_row_q6_K(src_expert + r * q6k_blocks_per_row, row_f32.data(), ne0);
-                quantize_row_q8_0_ref(row_f32.data(), row_q8.data(), ne0);
-
                 const int ct  = (int) (r / 32);
                 const int row = (int) (r % 32);
+                const block_q6_K * src_row = src_expert + r * sb_per_row;
 
-                for (int kt = 0; kt < q8_blocks_per_row; kt++) {
-                    uint8_t * tile_dst = matrix_dst + ((size_t) ct * n_k_tiles + kt) * tile_size;
-                    const block_q8_0 & b = row_q8[kt];
-                    for (int cp = 0; cp < 16; cp++) {
-                        tile_dst[cp * 64 + 2 * row + 0] = b.qs[cp * 2 + 0];
-                        tile_dst[cp * 64 + 2 * row + 1] = b.qs[cp * 2 + 1];
+                for (int kt = 0; kt < n_k_tiles; kt++) {
+                    const int sb        = kt / 8;   // super-block index
+                    const int kt_local  = kt % 8;   // k-tile within the super-block
+                    const block_q6_K * b = &src_row[sb];
+                    const float d_q6 = GGML_FP16_TO_FP32(b->d);
+
+                    uint8_t * tile   = matrix_dst + ((size_t) ct * n_k_tiles + kt) * tile_size;
+                    uint8_t * ql_pl  = tile + HEX_Q6K_TILE_QL_OFF;
+                    uint8_t * qh_pl  = tile + HEX_Q6K_TILE_QH_OFF;
+                    ggml_half * sc_pl = (ggml_half *) (tile + HEX_Q6K_TILE_SCALE_OFF);
+
+                    for (int lk = 0; lk < 32; lk++) {
+                        const int e = kt_local * 32 + lk;      // logical element within super-block
+                        const uint8_t q6 = hex_q6k_get(b, e);  // 0..63
+                        const uint8_t lo = q6 & 0xF;
+                        const uint8_t hi = q6 >> 4;
+                        ql_pl[row * 16 + (lk >> 1)] |= (lk & 1) ? (uint8_t)(lo << 4) : lo;
+                        qh_pl[row * 8  + (lk >> 2)] |= (uint8_t)(hi << ((lk & 3) * 2));
                     }
-                    ggml_half * scale_dst = (ggml_half *) (tile_dst + 1024);
-                    scale_dst[row] = b.d;
+                    // two per-16 effective scales for this tile (k 0..15 and 16..31)
+                    for (int sub = 0; sub < 2; sub++) {
+                        const int si = kt_local * 2 + sub;     // scales[] index within the super-block
+                        sc_pl[row * 2 + sub] = GGML_FP32_TO_FP16(d_q6 * (float) b->scales[si]);
+                    }
                 }
             }
         }
@@ -893,10 +938,9 @@ static void repack_q6_K_to_q8_0_tiled(ggml_tensor * t, const void * data, size_t
     GGML_UNUSED(size);
 }
 
-// Reverse of repack_q6_K_to_q8_0_tiled: read back the Q8_0 tiled storage and reconstruct Q6_K.
-// This path is not used during inference (the lm-head weight is only consumed on the DSP); it
-// exists for symmetry/debug. Reconstruction is approximate (Q8_0 -> f32 -> Q6_K requantization).
-static void repack_tiled_q8_0_to_q6_K(void * data, const ggml_tensor * t, size_t size) {
+// Reverse of repack_q6_K_tiled: reconstruct an (approximate) Q6_K weight from the native tiled
+// storage. Not used during inference; kept for symmetry so a stray read-back cannot corrupt data.
+static void repack_tiled_q6_K(void * data, const ggml_tensor * t, size_t size) {
     block_q6_K * dst_matrix = (block_q6_K *) data;
     int64_t ne0 = t->ne[0];
     int64_t ne1 = t->ne[1];
@@ -909,36 +953,39 @@ static void repack_tiled_q8_0_to_q6_K(void * data, const ggml_tensor * t, size_t
 
     const int n_col_tiles = ne1_padded / 32;
     const int n_k_tiles   = ne0_padded / 32;
-    const size_t tile_size   = HTP_MM_WEIGHT_TILE_SIZE_Q8_0;
+    const size_t tile_size   = HTP_MM_WEIGHT_TILE_SIZE_Q6_K;
     const size_t matrix_size = (size_t) n_col_tiles * n_k_tiles * tile_size;
 
-    const int64_t q6k_blocks_per_row = ne0 / QK_K;
-    const int64_t q8_blocks_per_row  = ne0 / QK8_0;
+    const int64_t sb_per_row = ne0 / QK_K;
 
-    std::vector<block_q8_0> row_q8(q8_blocks_per_row);
-    std::vector<float>      row_f32(ne0);
+    std::vector<float> row_f32(ne0);
 
     for (int i3 = 0; i3 < ne3; i3++) {
         for (int i2 = 0; i2 < ne2; i2++) {
-            block_q6_K *    dst_expert  = dst_matrix + (i3 * ne2 + i2) * (ne1 * q6k_blocks_per_row);
-            const uint8_t * matrix_src  = (const uint8_t *) t->data + (i3 * ne2 + i2) * matrix_size;
+            block_q6_K *    dst_expert = dst_matrix + (i3 * ne2 + i2) * (ne1 * sb_per_row);
+            const uint8_t * matrix_src = (const uint8_t *) t->data + (i3 * ne2 + i2) * matrix_size;
 
             for (int64_t r = 0; r < ne1; r++) {
                 const int ct  = (int) (r / 32);
                 const int row = (int) (r % 32);
 
-                for (int kt = 0; kt < q8_blocks_per_row; kt++) {
-                    const uint8_t * tile_src = matrix_src + ((size_t) ct * n_k_tiles + kt) * tile_size;
-                    block_q8_0 & b = row_q8[kt];
-                    for (int cp = 0; cp < 16; cp++) {
-                        b.qs[cp * 2 + 0] = tile_src[cp * 64 + 2 * row + 0];
-                        b.qs[cp * 2 + 1] = tile_src[cp * 64 + 2 * row + 1];
+                for (int kt = 0; kt < n_k_tiles; kt++) {
+                    const uint8_t *   tile  = matrix_src + ((size_t) ct * n_k_tiles + kt) * tile_size;
+                    const uint8_t *   ql_pl = tile + HEX_Q6K_TILE_QL_OFF;
+                    const uint8_t *   qh_pl = tile + HEX_Q6K_TILE_QH_OFF;
+                    const ggml_half * sc_pl = (const ggml_half *) (tile + HEX_Q6K_TILE_SCALE_OFF);
+
+                    for (int lk = 0; lk < 32; lk++) {
+                        const uint8_t lo = (lk & 1) ? (ql_pl[row * 16 + (lk >> 1)] >> 4)
+                                                    : (ql_pl[row * 16 + (lk >> 1)] & 0xF);
+                        const uint8_t hi = (qh_pl[row * 8 + (lk >> 2)] >> ((lk & 3) * 2)) & 3;
+                        const int q6 = (int) (lo | (hi << 4));
+                        const float eff = GGML_FP16_TO_FP32(sc_pl[row * 2 + (lk >> 4)]);
+                        row_f32[(size_t) kt * 32 + lk] = eff * (float) (q6 - 32);
                     }
-                    b.d = ((const ggml_half *) (tile_src + 1024))[row];
                 }
 
-                dequantize_row_q8_0(row_q8.data(), row_f32.data(), ne0);
-                quantize_row_q6_K_ref(row_f32.data(), dst_expert + r * q6k_blocks_per_row, ne0);
+                quantize_row_q6_K_ref(row_f32.data(), dst_expert + r * sb_per_row, ne0);
             }
         }
     }
@@ -1113,8 +1160,8 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
         case GGML_TYPE_Q6_K:
             GGML_ASSERT(offset == 0);
             GGML_ASSERT(offset + size <= ggml_nbytes(tensor));  // size is the incoming Q6_K data size
-            // Convert Q6_K -> Q8_0 tiled so the DSP can use the existing Q8_0 matmul path (lm-head).
-            repack_q6_K_to_q8_0_tiled(tensor, data, size);
+            // Repack Q6_K natively into the DSP 6-bit tiled layout (lm-head).
+            repack_q6_K_tiled(tensor, data, size);
             break;
 
         default:
@@ -1180,10 +1227,9 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
         case GGML_TYPE_Q6_K:
             GGML_ASSERT(offset == 0);
             GGML_ASSERT(offset + size <= ggml_nbytes(tensor));  // size is the Q6_K data size
-            // Storage was converted to Q8_0 (tiled) by set_tensor; reconstruct Q6_K on read.
-            // Not exercised during inference (the lm-head weight is only consumed on the DSP), but
-            // kept for symmetry with the other repack types so a stray read-back cannot corrupt data.
-            repack_tiled_q8_0_to_q6_K(data, tensor, size);
+            // Reconstruct Q6_K from the native 6-bit tiled storage. Not exercised during inference
+            // (the lm-head weight is only consumed on the DSP), kept for symmetry.
+            repack_tiled_q6_K(data, tensor, size);
             break;
 
         default:
@@ -1262,15 +1308,17 @@ static size_t ggml_backend_hexagon_buffer_type_get_alignment(ggml_backend_buffer
 }
 
 static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * t) {
-    // Repacked quantized weights are stored padded to 32 in the tiled layout of their storage type
-    // (Q6_K is stored as Q8_0 - see ggml_hexagon_repack_storage_type).
+    // Repacked quantized weights are stored padded to 32 in the DSP tiled layout. The per-row size
+    // is (ne0/32) k-tiles * (tile_size/32) bytes; this matches ggml_row_size for the flat repack
+    // types and gives the correct (native, compact) size for Q6_K whose tiled layout differs from
+    // its ggml row size.
     const ggml_type stype = ggml_hexagon_repack_storage_type(t->type);
     if (ggml_hexagon_is_repack_type(stype)) {
         int64_t ne0 = hex_round_up(t->ne[0], 32);
         int64_t ne1 = hex_round_up(t->ne[1], 32);
         int64_t ne2 = t->ne[2];
         int64_t ne3 = t->ne[3];
-        return ggml_row_size(stype, ne0) * ne1 * ne2 * ne3;
+        return ggml_hexagon_tiled_row_size(stype, ne0) * ne1 * ne2 * ne3;
     }
     return ggml_nbytes(t);
 
@@ -1430,7 +1478,7 @@ struct ggml_hexagon_opbatch {
             ne0 = hex_round_up(ne0, 32);
             ne1 = hex_round_up(ne1, 32);
         }
-        int64_t nb1 = is_repack ? ggml_row_size(eff_type, ne0) : t->nb[1];
+        int64_t nb1 = is_repack ? (int64_t) ggml_hexagon_tiled_row_size(eff_type, ne0) : t->nb[1];
         int64_t nb2 = is_repack ? nb1 * ne1 : t->nb[2];
         int64_t nb3 = is_repack ? nb2 * t->ne[2] : t->nb[3];
 
@@ -1480,7 +1528,7 @@ struct ggml_hexagon_opbatch {
             h.ne[3] = t->ne[3];
 
             h.nb[0] = t->nb[0];
-            h.nb[1] = ggml_row_size(eff_type, h.ne[0]);
+            h.nb[1] = ggml_hexagon_tiled_row_size(eff_type, h.ne[0]);
             h.nb[2] = h.nb[1] * h.ne[1];
             h.nb[3] = h.nb[2] * h.ne[2];
             h.size  = h.nb[3] * h.ne[3];
@@ -2385,7 +2433,7 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
     const int ne00  = src0->ne[0];
     const int ne11  = src1->ne[1];
     const int ne12  = src1->ne[2];
-    const int wtype = (int) ggml_hexagon_effective_tensor_type(src0);  // BF16->F16, Q6_K->Q8_0 in repack buffers
+    const int wtype = (int) ggml_hexagon_effective_tensor_type(src0);  // BF16->F16 in a repack buffer (Q6_K keeps its own type)
 
     // HMX weight tile requires N to be 32-aligned.
     if (ne01_padded % 32 != 0) {
@@ -2706,7 +2754,7 @@ static void ggml_hexagon_precompute_matmul_params_impl(
     const int ne12 = src1->ne[2];
     const int ne13 = src1->ne[3];
 
-    const int wtype = (int) ggml_hexagon_effective_tensor_type(src0);  // BF16->F16, Q6_K->Q8_0 in repack buffers
+    const int wtype = (int) ggml_hexagon_effective_tensor_type(src0);  // BF16->F16 in a repack buffer (Q6_K keeps its own type)
     const bool is_repack = ggml_hexagon_is_repack_type((ggml_type) wtype);
     const int ne00_padded = is_repack ? hex_round_up(ne00, 32) : ne00;
     const int ne01_padded = is_repack ? hex_round_up(ne01, 32) : ne01;
@@ -3685,7 +3733,7 @@ static bool mm_is_hmx_eligible(const ggml_tensor * t) {
     const ggml_tensor * src0 = t->src[0];
     const ggml_tensor * src1 = t->src[1];
 
-    const int wtype = (int) ggml_hexagon_effective_tensor_type(src0);  // BF16->F16, Q6_K->Q8_0 in repack buffers
+    const int wtype = (int) ggml_hexagon_effective_tensor_type(src0);  // BF16->F16 in a repack buffer (Q6_K keeps its own type)
     const bool is_repack    = ggml_hexagon_is_repack_type((ggml_type) wtype);
     const bool is_matmul_id = (t->op == GGML_OP_MUL_MAT_ID);
     const bool is_batched   = (src0->ne[2] * src0->ne[3] > 1 || src1->ne[2] * src1->ne[3] > 1);
@@ -3698,6 +3746,8 @@ static bool mm_is_hmx_eligible(const ggml_tensor * t) {
 static bool is_mergeable_mul_mat(const ggml_tensor * t) {
     if (!t || t->op != GGML_OP_MUL_MAT)   return false;
     if (t->src[1]->type != GGML_TYPE_F32) return false;
+    // Q6_K only has the standalone (non-fused) matmul kernel; keep it out of the fused/merged path.
+    if (t->src[0]->type == GGML_TYPE_Q6_K) return false;
     return ggml_is_quantized(t->src[0]->type) && !mm_is_hmx_eligible(t);
 }
 
@@ -4545,6 +4595,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     static_assert((unsigned int) HTP_TYPE_Q4_1 == (unsigned int) GGML_TYPE_Q4_1,
                   "please update hexagon_type to match ggml_type");
     static_assert((unsigned int) HTP_TYPE_Q8_0 == (unsigned int) GGML_TYPE_Q8_0,
+                  "please update hexagon_type to match ggml_type");
+    static_assert((unsigned int) HTP_TYPE_Q6_K == (unsigned int) GGML_TYPE_Q6_K,
                   "please update hexagon_type to match ggml_type");
     static_assert((unsigned int) HTP_TYPE_MXFP4 == (unsigned int) GGML_TYPE_MXFP4,
                   "please update hexagon_type to match ggml_type");
