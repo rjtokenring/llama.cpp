@@ -847,12 +847,14 @@ static void repack_tiled_q8_0(void * data, const ggml_tensor * t, size_t size) {
 }
 
 // --- Native Q6_K tiled layout (32 rows x 32 k per tile, 896 bytes) ---
-//   ql plane [0..511]   : row*16 + (k/2)          -> lo4(k even) | (lo4(k odd) << 4)
-//   qh plane [512..767] : row*8  + (k/4), shift (k%4)*2 -> hi2 (0..3)
-//   scales   [768..895] : (row*2 + k/16) fp16     -> eff_scale = d_q6 * scales[sub16]
-// The per-16 int8 sub-scale and the per-256 fp16 super-scale are folded into one fp16 eff_scale.
-#define HEX_Q6K_TILE_QL_OFF     0
-#define HEX_Q6K_TILE_QH_OFF     512
+// Stored "vrmpy-ready" so the DSP kernel needs no cross-lane shuffles: within each 128-byte
+// vector, byte 4*row + b holds the value for (row, k = 4*group + b). See the layout notes on
+// HTP_MM_WEIGHT_TILE_SIZE_Q6_K in htp/matmul-ops.h and tiled_vec_dot_q6_k_32x1.
+//   [0..511]   low 4 bits : vector i (=group/2) packs group 2i in the low nibble, 2i+1 in the high
+//   [512..767] high 2 bits: vector m (=group/4) packs group 4m+j at bit offset 2j
+//   [768..895] eff scales : 32 fp16 for k 0..15, then 32 fp16 for k 16..31 (one per row)
+#define HEX_Q6K_TILE_LO_OFF     0
+#define HEX_Q6K_TILE_HI_OFF     512
 #define HEX_Q6K_TILE_SCALE_OFF  768
 
 // Reconstruct the unsigned 6-bit value (0..63) for logical element e (0..QK_K-1) of a Q6_K block,
@@ -913,22 +915,26 @@ static void repack_q6_K_tiled(ggml_tensor * t, const void * data, size_t size) {
                     const float d_q6 = GGML_FP16_TO_FP32(b->d);
 
                     uint8_t * tile   = matrix_dst + ((size_t) ct * n_k_tiles + kt) * tile_size;
-                    uint8_t * ql_pl  = tile + HEX_Q6K_TILE_QL_OFF;
-                    uint8_t * qh_pl  = tile + HEX_Q6K_TILE_QH_OFF;
+                    uint8_t * lo_pl  = tile + HEX_Q6K_TILE_LO_OFF;
+                    uint8_t * hi_pl  = tile + HEX_Q6K_TILE_HI_OFF;
                     ggml_half * sc_pl = (ggml_half *) (tile + HEX_Q6K_TILE_SCALE_OFF);
 
                     for (int lk = 0; lk < 32; lk++) {
                         const int e = kt_local * 32 + lk;      // logical element within super-block
                         const uint8_t q6 = hex_q6k_get(b, e);  // 0..63
-                        const uint8_t lo = q6 & 0xF;
-                        const uint8_t hi = q6 >> 4;
-                        ql_pl[row * 16 + (lk >> 1)] |= (lk & 1) ? (uint8_t)(lo << 4) : lo;
-                        qh_pl[row * 8  + (lk >> 2)] |= (uint8_t)(hi << ((lk & 3) * 2));
+                        const int g = lk >> 2;                 // k-group (4 k per group)
+                        const int bb = lk & 3;                 // position within the group
+                        const int pos = row * 4 + bb;          // vrmpy byte slot within a vector
+                        // low 4 bits: vector g/2, low nibble for even g, high nibble for odd g
+                        lo_pl[(g >> 1) * 128 + pos] |= (g & 1) ? (uint8_t) ((q6 & 0xF) << 4)
+                                                              : (uint8_t) (q6 & 0xF);
+                        // high 2 bits: vector g/4, at bit offset 2*(g%4)
+                        hi_pl[(g >> 2) * 128 + pos] |= (uint8_t) ((q6 >> 4) << ((g & 3) * 2));
                     }
-                    // two per-16 effective scales for this tile (k 0..15 and 16..31)
+                    // per-16 effective scales: lanes 0..31 are k 0..15, lanes 32..63 are k 16..31
                     for (int sub = 0; sub < 2; sub++) {
                         const int si = kt_local * 2 + sub;     // scales[] index within the super-block
-                        sc_pl[row * 2 + sub] = GGML_FP32_TO_FP16(d_q6 * (float) b->scales[si]);
+                        sc_pl[sub * 32 + row] = GGML_FP32_TO_FP16(d_q6 * (float) b->scales[si]);
                     }
                 }
             }
@@ -971,16 +977,19 @@ static void repack_tiled_q6_K(void * data, const ggml_tensor * t, size_t size) {
 
                 for (int kt = 0; kt < n_k_tiles; kt++) {
                     const uint8_t *   tile  = matrix_src + ((size_t) ct * n_k_tiles + kt) * tile_size;
-                    const uint8_t *   ql_pl = tile + HEX_Q6K_TILE_QL_OFF;
-                    const uint8_t *   qh_pl = tile + HEX_Q6K_TILE_QH_OFF;
+                    const uint8_t *   lo_pl = tile + HEX_Q6K_TILE_LO_OFF;
+                    const uint8_t *   hi_pl = tile + HEX_Q6K_TILE_HI_OFF;
                     const ggml_half * sc_pl = (const ggml_half *) (tile + HEX_Q6K_TILE_SCALE_OFF);
 
                     for (int lk = 0; lk < 32; lk++) {
-                        const uint8_t lo = (lk & 1) ? (ql_pl[row * 16 + (lk >> 1)] >> 4)
-                                                    : (ql_pl[row * 16 + (lk >> 1)] & 0xF);
-                        const uint8_t hi = (qh_pl[row * 8 + (lk >> 2)] >> ((lk & 3) * 2)) & 3;
+                        const int g   = lk >> 2;
+                        const int bb  = lk & 3;
+                        const int pos = row * 4 + bb;
+                        const uint8_t lo_byte = lo_pl[(g >> 1) * 128 + pos];
+                        const uint8_t lo = (g & 1) ? (uint8_t) (lo_byte >> 4) : (uint8_t) (lo_byte & 0xF);
+                        const uint8_t hi = (uint8_t) ((hi_pl[(g >> 2) * 128 + pos] >> ((g & 3) * 2)) & 3);
                         const int q6 = (int) (lo | (hi << 4));
-                        const float eff = GGML_FP16_TO_FP32(sc_pl[row * 2 + (lk >> 4)]);
+                        const float eff = GGML_FP16_TO_FP32(sc_pl[(lk >> 4) * 32 + row]);
                         row_f32[(size_t) kt * 32 + lk] = eff * (float) (q6 - 32);
                     }
                 }
@@ -2602,7 +2611,8 @@ static void ggml_hexagon_precompute_hvx_mm_params(
             kparams->vtcm_src1_size = L.src1_bytes;
             kparams->vtcm_dst_size  = L.dst_bytes;
         } else {
-            bool try_tiled = (k_align && opt_mm_select >= 2);
+            // Q6_K is tiled-only (no flat kernel), so never let it pick the flat path.
+            bool try_tiled = k_align && (opt_mm_select >= 2 || wtype == GGML_TYPE_Q6_K);
             if (try_tiled) {
                 kparams->src1_row_size = (wtype == GGML_TYPE_Q4_1) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
                 if (src1_nrows < (int)sess->n_threads) {
@@ -2641,6 +2651,17 @@ static void ggml_hexagon_precompute_hvx_mm_params(
                     goto done_quant;
                 }
                 HEX_VERBOSE("ggml-hex: %s HVX tiled path VTCM size needed (%zu) > budget (%zu), falling back to HVX flat\n", sess->name.c_str(), L.total_bytes, vtcm_budget);
+
+                if (wtype == GGML_TYPE_Q6_K) {
+                    // Q6_K only has a tiled kernel. Keep the (over-budget) tiled params so that
+                    // ggml_hexagon_supported_mul_mat rejects the op and it runs on CPU, rather
+                    // than silently taking the flat path.
+                    kparams->vtcm_size      = L.total_bytes;
+                    kparams->vtcm_src0_size = L.src0_bytes;
+                    kparams->vtcm_src1_size = L.src1_bytes;
+                    kparams->vtcm_dst_size  = L.dst_bytes;
+                    goto done_quant;
+                }
             }
 
             // Flat HVX fallback
