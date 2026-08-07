@@ -4274,6 +4274,14 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
         return false;
     }
 
+    // Zero-element nodes are no-ops: graph_compute skips them via op_is_compute().
+    // Claiming them costs nothing and keeps them from splitting the graph mid-layer
+    // (build_rs() emits a zero-sized SCALE per recurrent layer during decode, and
+    // ggml_is_permuted() reports true for it since nb[0] > nb[1] == 0).
+    if (ggml_is_empty(op)) {
+        return true;
+    }
+
     // all srcs & dsts must be mapped to the same session
     if (!ggml_hexagon_supported_buffers(sess, op)) {
         ggml_hexagon_dump_op_supp(sess->name, op, false);
