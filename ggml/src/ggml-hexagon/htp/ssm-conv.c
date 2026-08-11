@@ -220,20 +220,12 @@ static inline void transpose_src0_block(const float * src0_block,
     for (uint32_t t0 = 0; t0 < ncs; t0 += T_TILE) {
         const uint32_t t_n = MIN(T_TILE, ncs - t0);
 
-        // Load 32 rows (channels) of T_TILE samples; pad missing channels with zeros.
+        // Load 32 rows (channels) of T_TILE samples. When t_n < T_TILE this over-reads into
+        // the next row, but the transposed rows >= t_n are never stored, so the extra lanes
+        // are dropped (same over-read convention as hvx_copy_uu).
         for (uint32_t r = 0; r < cb_n; ++r) {
             const float * src_row = src0_block + r * ncs + t0;
-            if (t_n == T_TILE) {
-                sub[r] = *(const HVX_UVector *) src_row;
-            } else {
-                HVX_Vector v = hvx_vec_splat_f32(0.0f);
-                hvx_vec_store_u(&v, t_n * sizeof(float), hvx_vec_splat_f32(0.0f));
-
-                float __attribute__((aligned(VLEN))) tmp[VLEN_FP32] = { 0 };
-                for (uint32_t k = 0; k < t_n; ++k) tmp[k] = src_row[k];
-                v = *(const HVX_Vector *) tmp;
-                sub[r] = v;
-            }
+            sub[r] = *(const HVX_UVector *) src_row;
         }
         for (uint32_t r = cb_n; r < T_TILE; ++r) {
             sub[r] = hvx_vec_splat_f32(0.0f);
@@ -360,7 +352,11 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
 
     if (!(octx->flags & HTP_OPFLAGS_SKIP_COMPUTE)) {
         uint32_t use_hvx = 0;
-        if (d_inner >= VLEN_FP32 && n_t >= VLEN_FP32) {
+        // The HVX kernel vectorizes over d_inner and works for any n_t, but its staging cost is
+        // near-constant (~240 us on 8192 channels) while the scalar kernel scales with n_t:
+        // measured crossover is at n_t == 3. It reads src0 rows with an ncs stride (see
+        // transpose_src0_block), so src0 must be contiguous.
+        if (d_inner >= VLEN_FP32 && n_t >= 3 && src0->nb[1] == src0->ne[0] * sizeof(float)) {
             use_hvx = 1;
         }
 
@@ -374,6 +370,8 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
 
         uint32_t d_inner_tile = (src0_T_max / sizeof(float)) / ncs;
         d_inner_tile -= (d_inner_tile % VLEN_FP32);
+        // small ncs (short token runs) makes the tile huge; no point going past the per-thread share
+        d_inner_tile = MIN(d_inner_tile, d_inner_per_thread);
         if (d_inner_tile == 0) {
             FARF(HIGH, "ssm_conv-f32: inner tile rounds to 0 (ncs=%u), falling back to scalar\n", ncs);
             use_hvx = 0;
