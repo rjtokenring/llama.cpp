@@ -512,3 +512,243 @@ int op_argsort(struct htp_ops_context * octx) {
 
     return HTP_STATUS_OK;
 }
+
+// ---------------------------------------------------------------------------
+// argmax / top-k (used by the backend samplers; row split across threads)
+
+// Row base pointer from a flat row index (rows = ne1*ne2*ne3).
+static inline uint8_t * row_ptr(const struct htp_tensor * t, uint32_t r) {
+    const uint32_t i1  = r % t->ne[1];
+    const uint32_t i23 = r / t->ne[1];
+    const uint32_t i2  = i23 % t->ne[2];
+    const uint32_t i3  = i23 / t->ne[2];
+    return (uint8_t *) t->data + i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3];
+}
+
+struct htp_argmax_context {
+    struct htp_ops_context * octx;
+    uint32_t  nrows;
+    uint32_t  chunk;     // elements of each row scanned per thread (multiple of 32)
+    float   * part_val;  // [nrows][nth] per-chunk best
+    int32_t * part_idx;
+};
+
+// Best (value, index) over p[0..n): ties keep the smallest index, matching the CPU backend.
+static void argmax_span_f32(const float * p, uint32_t n, float * out_v, int32_t * out_i) {
+    float   bv = -INFINITY;
+    int32_t bi = INT32_MAX;
+
+    const uint32_t nvec = n / 32;
+    if (nvec) {
+        HVX_Vector vmax = hvx_vec_splat_f32(-INFINITY);
+        HVX_Vector vidx = Q6_V_vsplat_R(0);
+        HVX_Vector vcur = *(const HVX_Vector *) argosrt_ramp_lut;
+        const HVX_Vector vstep = Q6_V_vsplat_R(32);
+
+        for (uint32_t i = 0; i < nvec; i++) {
+            HVX_Vector v = *(const HVX_UVector *) (p + i * 32);
+            HVX_VectorPred q = Q6_Q_vcmp_gt_VsfVsf(v, vmax);  // strict > keeps the first max per lane
+            vmax = Q6_V_vmux_QVV(q, v, vmax);
+            vidx = Q6_V_vmux_QVV(q, vcur, vidx);
+            vcur = Q6_Vw_vadd_VwVw(vcur, vstep);
+        }
+
+        float   lv[32] __attribute__((aligned(VLEN)));
+        int32_t li[32] __attribute__((aligned(VLEN)));
+        *(HVX_Vector *) lv = vmax;
+        *(HVX_Vector *) li = vidx;
+        for (uint32_t l = 0; l < 32; l++) {
+            if (lv[l] > bv || (lv[l] == bv && li[l] < bi)) {
+                bv = lv[l];
+                bi = li[l];
+            }
+        }
+    }
+    for (uint32_t j = nvec * 32; j < n; j++) {
+        if (p[j] > bv) {
+            bv = p[j];
+            bi = (int32_t) j;
+        }
+    }
+
+    *out_v = bv;
+    *out_i = bi;
+}
+
+static void argmax_thread_f32(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_argmax_context * actx = (struct htp_argmax_context *) data;
+    const struct htp_tensor * src0 = actx->octx->src[0];
+
+    const uint32_t ne00 = src0->ne[0];
+    const uint32_t i0   = ith * actx->chunk;
+    const uint32_t i1   = MIN(i0 + actx->chunk, ne00);
+
+    for (uint32_t r = 0; r < actx->nrows; r++) {
+        float   bv = -INFINITY;
+        int32_t bi = INT32_MAX;
+        if (i0 < i1) {
+            argmax_span_f32((const float *) row_ptr(src0, r) + i0, i1 - i0, &bv, &bi);
+            bi += (int32_t) i0;
+        }
+        actx->part_val[r * nth + ith] = bv;
+        actx->part_idx[r * nth + ith] = bi;
+    }
+}
+
+int op_argmax(struct htp_ops_context * octx) {
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * dst  = octx->dst;
+
+    if (src0->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_I32) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t nrows     = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const uint32_t n_threads = octx->n_threads;
+
+    const size_t spad = hex_round_up(nrows * n_threads * (sizeof(float) + sizeof(int32_t)), 256);
+    if (octx->ctx->vtcm_size < spad) {
+        return HTP_STATUS_VTCM_TOO_SMALL;
+    }
+
+    struct htp_argmax_context actx;
+    actx.octx     = octx;
+    actx.nrows    = nrows;
+    actx.chunk    = hex_round_up((src0->ne[0] + n_threads - 1) / n_threads, 32);
+    actx.part_val = (float *) octx->ctx->vtcm_base;
+    actx.part_idx = (int32_t *) (actx.part_val + nrows * n_threads);
+
+    worker_pool_run_func(octx->ctx->worker_pool, argmax_thread_f32, &actx, n_threads);
+
+    // merge the per-thread chunks; ascending thread order + strict > keeps the smallest index on ties
+    int32_t * dst_data = (int32_t *) dst->data;
+    for (uint32_t r = 0; r < nrows; r++) {
+        float   bv = -INFINITY;
+        int32_t bi = INT32_MAX;
+        for (uint32_t t = 0; t < n_threads; t++) {
+            const float v = actx.part_val[r * n_threads + t];
+            if (v > bv) {
+                bv = v;
+                bi = actx.part_idx[r * n_threads + t];
+            }
+        }
+        dst_data[r] = bi;
+    }
+
+    return HTP_STATUS_OK;
+}
+
+struct htp_topk_context {
+    struct htp_ops_context * octx;
+    uint32_t  nrows;
+    uint32_t  k;
+    uint32_t  chunk;
+    float   * cand_val;  // [nrows][nth][k] per-chunk candidates, sorted descending
+    int32_t * cand_idx;
+};
+
+// Insert (v, idx) into a descending list of size k. Strict > on both the admission test and the
+// shift keeps the earliest index for equal values, matching the CPU partial_sort selection.
+static inline uint32_t topk_insert(float * cv, int32_t * ci, uint32_t cnt, uint32_t k, float v, int32_t idx) {
+    if (cnt == k) {
+        if (!(v > cv[k - 1])) {
+            return cnt;
+        }
+        cnt--;
+    }
+    uint32_t pos = cnt;
+    while (pos > 0 && v > cv[pos - 1]) {
+        cv[pos] = cv[pos - 1];
+        ci[pos] = ci[pos - 1];
+        pos--;
+    }
+    cv[pos] = v;
+    ci[pos] = idx;
+    return cnt + 1;
+}
+
+static void topk_thread_f32(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_topk_context * tctx = (struct htp_topk_context *) data;
+    const struct htp_tensor * src0 = tctx->octx->src[0];
+
+    const uint32_t ne00 = src0->ne[0];
+    const uint32_t k    = tctx->k;
+    const uint32_t i0   = ith * tctx->chunk;
+    const uint32_t i1   = MIN(i0 + tctx->chunk, ne00);
+
+    for (uint32_t r = 0; r < tctx->nrows; r++) {
+        const float * row = (const float *) row_ptr(src0, r);
+        float   * cv = tctx->cand_val + (r * nth + ith) * k;
+        int32_t * ci = tctx->cand_idx + (r * nth + ith) * k;
+
+        uint32_t cnt = 0;
+        for (uint32_t j = i0; j < i1; j++) {
+            cnt = topk_insert(cv, ci, cnt, k, row[j], (int32_t) j);
+        }
+        for (; cnt < k; cnt++) {
+            cv[cnt] = -INFINITY;
+            ci[cnt] = INT32_MAX;
+        }
+    }
+}
+
+int op_top_k(struct htp_ops_context * octx) {
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * dst  = octx->dst;
+
+    if (src0->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_I32) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    if (dst->ne[0] > 128) {  // merge scratch below is sized for k <= 128 (host enforces this too)
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t nrows     = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const uint32_t k         = dst->ne[0];
+    const uint32_t n_threads = octx->n_threads;
+
+    const size_t spad = hex_round_up(nrows * n_threads * k * (sizeof(float) + sizeof(int32_t)), 256);
+    if (octx->ctx->vtcm_size < spad) {
+        return HTP_STATUS_VTCM_TOO_SMALL;
+    }
+
+    struct htp_topk_context tctx;
+    tctx.octx     = octx;
+    tctx.nrows    = nrows;
+    tctx.k        = k;
+    tctx.chunk    = hex_round_up((src0->ne[0] + n_threads - 1) / n_threads, 32);
+    tctx.cand_val = (float *) octx->ctx->vtcm_base;
+    tctx.cand_idx = (int32_t *) (tctx.cand_val + nrows * n_threads * k);
+
+    worker_pool_run_func(octx->ctx->worker_pool, topk_thread_f32, &tctx, n_threads);
+
+    // merge: candidates are visited in ascending thread order (= ascending source index),
+    // so the strict > insert keeps the earliest index for equal values
+    float   mv[128];
+    int32_t mi[128];
+    for (uint32_t r = 0; r < nrows; r++) {
+        uint32_t cnt = 0;
+        for (uint32_t t = 0; t < n_threads; t++) {
+            const float   * cv = tctx.cand_val + (r * n_threads + t) * k;
+            const int32_t * ci = tctx.cand_idx + (r * n_threads + t) * k;
+            for (uint32_t j = 0; j < k && ci[j] != INT32_MAX; j++) {
+                cnt = topk_insert(mv, mi, cnt, k, cv[j], ci[j]);
+            }
+        }
+        int32_t * dst_row = (int32_t *) row_ptr(dst, r);
+        for (uint32_t j = 0; j < k; j++) {
+            dst_row[j] = mi[j];
+        }
+    }
+
+    return HTP_STATUS_OK;
+}

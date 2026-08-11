@@ -151,11 +151,13 @@ static void get_rows_thread_f32_f32_hvx(unsigned int nth, unsigned int ith, void
 int op_get_rows(struct htp_ops_context * octx) {
     get_rows_preamble;
 
-    if (octx->src[0]->type != HTP_TYPE_F32) {
+    // I32 rows use the F32 path unchanged: the kernels move 4-byte elements without
+    // interpreting them (used by the backend samplers to gather token-id candidates)
+    if (octx->src[0]->type != HTP_TYPE_F32 && octx->src[0]->type != HTP_TYPE_I32) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
-    if (octx->dst->type != HTP_TYPE_F32) {
+    if (octx->dst->type != octx->src[0]->type) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
