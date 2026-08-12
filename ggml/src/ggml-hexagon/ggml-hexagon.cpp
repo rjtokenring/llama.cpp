@@ -3953,6 +3953,15 @@ static bool ggml_hexagon_supported_buffer(ggml_hexagon_session *sess, const stru
 }
 
 static bool ggml_hexagon_supported_buffers(ggml_hexagon_session *sess, const struct ggml_tensor * t) {
+    // the dst of an in-place op (e.g. CLAMP) aliases its view source: ggml-backend allocates it in
+    // view_src->buffer, which the scheduler is free to place on another backend. We can't tell where
+    // it will land while the graph is still being split, so we take the op only if the view source
+    // already lives in one of our buffers.
+    if (t->view_src) {
+        if (!t->view_src->buffer) return false;                            // not allocated yet
+        if (!ggml_hexagon_supported_buffer(sess, t->view_src)) return false;
+    }
+
     // all srcs & dsts must be mapped to the same session
     if (!ggml_hexagon_supported_buffer(sess, t)) {
         return false;
