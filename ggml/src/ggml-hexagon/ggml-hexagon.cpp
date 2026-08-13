@@ -296,6 +296,22 @@ struct ggml_hexagon_session {
     void allocate(int dev_id) noexcept(false);
     void release() noexcept(true);
 
+    // The FastRPC session is a limited system-wide resource. Processes that only enumerate
+    // devices (e.g. llama-server in router mode) must not consume it, so the session is
+    // opened on first actual use instead of at backend registration.
+    void ensure_allocated() noexcept(false) {
+        std::call_once(alloc_once, [this]() {
+            try {
+                allocate(this->dev_id);
+            } catch (...) {
+                release();  // drop partially allocated resources; allocate() restarts clean on retry
+                throw;
+            }
+        });
+    }
+
+    std::once_flag alloc_once;
+
     void enqueue_op(const htp_opnode & node);
     void flush(bool all = true);
 
@@ -1066,6 +1082,7 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(
             ggml_backend_buffer_type_t buffer_type, size_t size) {
     auto sess = static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type->context)->sess;
     try {
+        sess->ensure_allocated();
         size += 4 * 1024;  // guard page
         ggml_hexagon_shared_buffer * sbuf = new ggml_hexagon_shared_buffer(sess, size);
         return ggml_backend_buffer_init(buffer_type, ggml_backend_hexagon_buffer_interface, sbuf, size);
@@ -1079,6 +1096,7 @@ static ggml_backend_buffer_t ggml_backend_hexagon_repack_buffer_type_alloc_buffe
             ggml_backend_buffer_type_t buffer_type, size_t size) {
     auto sess = static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type->context)->sess;
     try {
+        sess->ensure_allocated();
         size += 4 * 1024;  // guard page
         ggml_hexagon_shared_buffer * sbuf = new ggml_hexagon_shared_buffer(sess, size);
         return ggml_backend_buffer_init(buffer_type, ggml_backend_hexagon_buffer_interface, sbuf, size);
@@ -1859,7 +1877,9 @@ void ggml_hexagon_session::allocate(int dev_id) noexcept(false) {
 }
 
 void ggml_hexagon_session::release() noexcept(true) {
-    GGML_LOG_INFO("ggml-hex: releasing session: %s\n", this->name.c_str());
+    if (this->valid_handle) {
+        GGML_LOG_INFO("ggml-hex: releasing session: %s\n", this->name.c_str());
+    }
 
     int err;
 
@@ -1908,18 +1928,24 @@ ggml_hexagon_session::ggml_hexagon_session(int dev_id, ggml_backend_dev_t dev) n
     op_batch = nullptr;
     op_queue = nullptr;
 
-    try {
-        allocate(dev_id);
+    // no FastRPC calls here: the session is allocated lazily via ensure_allocated()
+    this->valid_session = false;
+    this->valid_handle  = false;
+    this->valid_queue   = false;
+    this->valid_iface   = false;
 
-        buffer_type.iface   = ggml_backend_hexagon_buffer_type_interface;
-        buffer_type.context = new ggml_backend_hexagon_buffer_type_context(this->name, this);
+    this->domain_id   = 3;  // Default for CDSP, updated after the session is created
+    this->session_id  = 0;  // Default for CDSP, updated after the session is created
+    this->dev_id      = dev_id;
+    this->name        = std::string("HTP") + std::to_string(dev_id);
+    this->op_pending  = 0;
+    this->max_bufsize = opt_mbuf;
 
-        repack_buffer_type.iface   = ggml_backend_hexagon_repack_buffer_type_interface;
-        repack_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(this->name + "-REPACK", this);
-    } catch (const std::exception & exc) {
-        release();
-        throw;
-    }
+    buffer_type.iface   = ggml_backend_hexagon_buffer_type_interface;
+    buffer_type.context = new ggml_backend_hexagon_buffer_type_context(this->name, this);
+
+    repack_buffer_type.iface   = ggml_backend_hexagon_repack_buffer_type_interface;
+    repack_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(this->name + "-REPACK", this);
 }
 
 ggml_hexagon_session::~ggml_hexagon_session() noexcept(true) {
@@ -3885,6 +3911,13 @@ bool ggml_backend_is_hexagon(ggml_backend_t backend) {
 static ggml_backend_t ggml_backend_hexagon_device_init(ggml_backend_dev_t dev, const char * params) {
     auto sess = static_cast<ggml_hexagon_session *>(dev->context);
 
+    try {
+        sess->ensure_allocated();
+    } catch (const std::exception & exc) {
+        GGML_LOG_ERROR("ggml-hex: %s failed to allocate session: %s\n", sess->c_name(), exc.what());
+        return nullptr;
+    }
+
     return new ggml_backend{
         /* .guid      = */ ggml_backend_hexagon_guid(),
         /* .interface = */ hexagon_backend_i,
@@ -4056,6 +4089,13 @@ static bool ggml_hexagon_supported_fill(const struct ggml_hexagon_session * sess
 
 static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     auto sess = static_cast<ggml_hexagon_session *>(dev->context);
+
+    // op support depends on the HW capabilities (hvx/hmx/vtcm) queried when the session is opened
+    try {
+        sess->ensure_allocated();
+    } catch (const std::exception & exc) {
+        GGML_ABORT("ggml-hex: %s failed to allocate session: %s", sess->c_name(), exc.what());
+    }
 
     // reject ops that match the filter
     if (opt_opfilter && std::regex_match(ggml_op_desc(op), *opt_opfilter)) {
@@ -4235,8 +4275,9 @@ static bool ggml_backend_hexagon_device_supports_buft(ggml_backend_dev_t dev, gg
     auto s0 = static_cast<ggml_hexagon_session *>(dev->context);
     auto s1 = static_cast<ggml_backend_hexagon_buffer_type_context *>(buft->context)->sess;
 
-    // Need session/domain-id for buffers to be compatible
-    bool supp = (s0->session_id == s1->session_id);
+    // Buffers are compatible only within the same session; compare the session objects
+    // themselves since session_id is assigned when the session is (lazily) opened
+    bool supp = (s0 == s1);
 
     HEX_VERBOSE("ggml-hex: %s device-supports-buft %s (%d)\n", s0->name.c_str(), s1->name.c_str(), (int) supp);
 
