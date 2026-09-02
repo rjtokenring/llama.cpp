@@ -386,6 +386,7 @@ struct ggml_hexagon_session {
 
     std::unordered_map<int, std::unique_ptr<ggml_hexagon_shared_buffer>> cloned_buffers;
     std::unordered_set<ggml_hexagon_session *>                           sync_peers;
+    std::unordered_set<ggml_hexagon_session *>                           drain_peers;
 
     uint32_t n_threads   = 0;
     uint32_t n_hvx       = 0;
@@ -424,6 +425,25 @@ struct ggml_hexagon_session {
 
     void add_sync_peer(ggml_hexagon_session * peer) {
         sync_peers.insert(peer);
+    }
+
+    // Sessions with pending copies into this session's buffers (same physical NPU, no fence).
+    // They are drained (pushed and waited for) right before this session pushes its own batch.
+    void add_drain_peer(ggml_hexagon_session * peer) {
+        drain_peers.insert(peer);
+    }
+
+    void flush_drain_peers() {
+        if (drain_peers.empty()) return;
+
+        // take the set first: a peer flush can re-enter this session
+        std::unordered_set<ggml_hexagon_session *> peers = std::move(drain_peers);
+        drain_peers.clear();
+
+        for (auto * peer : peers) {
+            peer->flush_batch();
+            peer->flush_pending(true);
+        }
     }
 
     void flush_sync_peers() {
@@ -2755,6 +2775,9 @@ void ggml_hexagon_session::flush_pending(bool all) {
 void ggml_hexagon_session::flush_batch(size_t min_ops) {
     if (op_batch->n_ops < min_ops) { return; }
 
+    // copies from other sessions must land before the ops that consume them start
+    flush_drain_peers();
+
     htp_opbatch_req req {};
     dspqueue_buffer dbuf{};
 
@@ -3023,7 +3046,7 @@ bool ggml_hexagon_session::clone_buffer(const ggml_hexagon_shared_buffer *sbuf)
     if (this->cloned_buffers.find(sbuf->fd()) != this->cloned_buffers.end()) return true;
 
     HEX_VERBOSE("ggml-hex: %s clone-buffer: %s base %p size %zu fd %d\n", this->name.c_str(),
-                sbuf->c_name(), sbuf->base(), sbuf->size(), sbuf->fd());
+                sbuf->c_name(), (void *) sbuf->base(), sbuf->size(), sbuf->fd());
 
     auto clone = std::make_unique<ggml_hexagon_shared_buffer>(this, *sbuf);
     try {
@@ -5490,8 +5513,9 @@ static bool ggml_hexagon_cpy_tensor_async_virt(ggml_backend_t backend_src, ggml_
     HEX_VERBOSE("ggml-hex: %s cpy-tensor-async %s -> %s size %zu\n",
                 sess_dst->name.c_str(), src->name, dst->name, ggml_nbytes(src));
 
+    // Batch the copies in the source session and wait once, when the destination pushes its next batch
     sess_src->enqueue_cpy(src, dst);
-    sess_src->flush(true);
+    sess_dst->add_drain_peer(sess_src);
 
     return true;
 }
@@ -5585,6 +5609,7 @@ static void ggml_backend_hexagon_get_tensor_async(ggml_backend_t backend, const 
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
     HEX_VERBOSE("ggml-hex: %s get-tensor-async %s : data %p offset %zu size %zu usage %d\n",
                 sess->c_name(), tensor->name, data, offset, size, tensor->buffer ? (int) tensor->buffer->usage : -1);
+    sess->flush_drain_peers();
     sess->flush(true);
     ggml_backend_tensor_get(tensor, data, offset, size);
 }
@@ -5614,6 +5639,7 @@ static void ggml_backend_hexagon_get_tensor_2d_async(ggml_backend_t backend,
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
     HEX_VERBOSE("ggml-hex: %s get-tensor-2d-async %s : data %p offset %zu size %zu n_copies %zu stride_tensor %zu stride_data %zu usage %d\n",
                 sess->c_name(), tensor->name, data, offset, size, n_copies, stride_tensor, stride_data, tensor->buffer ? (int) tensor->buffer->usage : -1);
+    sess->flush_drain_peers();
     sess->flush(true);
     ggml_backend_tensor_get_2d(tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
