@@ -3195,7 +3195,7 @@ bool ggml_hexagon_session::clone_buffer(const ggml_hexagon_shared_buffer *sbuf)
     if (this->cloned_buffers.find(sbuf->fd()) != this->cloned_buffers.end()) return true;
 
     HEX_VERBOSE("ggml-hex: %s clone-buffer: %s base %p size %zu fd %d\n", this->name.c_str(),
-                sbuf->c_name(), sbuf->base(), sbuf->size(), sbuf->fd());
+                sbuf->c_name(), (void *) sbuf->base(), sbuf->size(), sbuf->fd());
 
     auto clone = std::make_unique<ggml_hexagon_shared_buffer>(this, *sbuf);
     try {
