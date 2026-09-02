@@ -1331,8 +1331,10 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
                         src0->type == HTP_TYPE_MXFP4);
 
     // Compute src0_nrows_per_thread
+    // src2 tail (fused MUL_MAT+ADD) copies per-thread slices of src2 into VTCM and adds them
+    // with aligned vector loads: keep the row split a multiple of 32 so the slices are 128-byte aligned
     mmctx->src0_nrows_per_thread  = fastdiv(src0_nrows + octx->n_threads - 1, &octx->ctx->n_threads_div);
-    if (is_repacked) {
+    if (is_repacked || src2) {
         mmctx->src0_nrows_per_thread = hex_round_up(mmctx->src0_nrows_per_thread, 32);
     } else {
         mmctx->src0_nrows_per_thread += (mmctx->src0_nrows_per_thread & 1); // round up to even
