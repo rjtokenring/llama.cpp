@@ -2799,6 +2799,8 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
 
 void ggml_hexagon_session::flush(bool all) {
     flush_sync_peers();
+    // also when there is nothing to push: the host may be about to read a tensor another session is copying into
+    flush_drain_peers();
     flush_batch();
     flush_pending(all);
 }
@@ -5635,7 +5637,6 @@ static void ggml_backend_hexagon_get_tensor_async(ggml_backend_t backend, const 
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
     HEX_VERBOSE("ggml-hex: %s get-tensor-async %s : data %p offset %zu size %zu usage %d\n",
                 sess->c_name(), tensor->name, data, offset, size, tensor->buffer ? (int) tensor->buffer->usage : -1);
-    sess->flush_drain_peers();
     sess->flush(true);
     ggml_backend_tensor_get(tensor, data, offset, size);
 }
@@ -5665,7 +5666,6 @@ static void ggml_backend_hexagon_get_tensor_2d_async(ggml_backend_t backend,
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
     HEX_VERBOSE("ggml-hex: %s get-tensor-2d-async %s : data %p offset %zu size %zu n_copies %zu stride_tensor %zu stride_data %zu usage %d\n",
                 sess->c_name(), tensor->name, data, offset, size, n_copies, stride_tensor, stride_data, tensor->buffer ? (int) tensor->buffer->usage : -1);
-    sess->flush_drain_peers();
     sess->flush(true);
     ggml_backend_tensor_get_2d(tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
