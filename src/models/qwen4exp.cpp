@@ -744,6 +744,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // TODO: enable sparse attention when we are ready
+    // ref: https://github.com/ggml-org/llama.cpp/pull/27970
+    //ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
@@ -933,10 +936,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv", il);
     cb(v_conv, "v_conv", il);
 
+
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
 
     // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
     if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
