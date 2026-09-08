@@ -387,6 +387,7 @@ struct ggml_hexagon_session {
     std::unordered_map<int, std::unique_ptr<ggml_hexagon_shared_buffer>> cloned_buffers;
     std::unordered_set<ggml_hexagon_session *>                           sync_peers;
     std::unordered_set<ggml_hexagon_session *>                           drain_peers;
+    std::unordered_set<ggml_hexagon_session *>                           wait_peers;
 
     uint32_t n_threads   = 0;
     uint32_t n_hvx       = 0;
@@ -427,8 +428,9 @@ struct ggml_hexagon_session {
         sync_peers.insert(peer);
     }
 
-    // Sessions with pending copies into this session's buffers (same physical NPU, no fence).
-    // They are drained (pushed and waited for) right before this session pushes its own batch.
+    // Sessions on the same physical NPU whose buffers this session reads (copies into our buffers,
+    // or inputs mapped with clone_buffer). They are drained (pushed and waited for) right before this
+    // session pushes its own batch, so the data is complete when our ops start (RAW).
     void add_drain_peer(ggml_hexagon_session * peer) {
         drain_peers.insert(peer);
     }
@@ -442,6 +444,23 @@ struct ggml_hexagon_session {
 
         for (auto * peer : peers) {
             peer->flush_batch();
+            peer->flush_pending(true);
+        }
+    }
+
+    // Sessions that read this session's buffers. Their batch is already pushed when they register here,
+    // so before we push the next batch (which reuses our compute buffers) we only wait for them (WAR).
+    void add_wait_peer(ggml_hexagon_session * peer) {
+        wait_peers.insert(peer);
+    }
+
+    void flush_wait_peers() {
+        if (wait_peers.empty()) return;
+
+        std::unordered_set<ggml_hexagon_session *> peers = std::move(wait_peers);
+        wait_peers.clear();
+
+        for (auto * peer : peers) {
             peer->flush_pending(true);
         }
     }
@@ -2760,8 +2779,8 @@ void ggml_hexagon_session::flush_pending(bool all) {
         }
 
         if (rsp.status != HTP_STATUS_OK) {
-            GGML_LOG_ERROR("ggml-hex: %s dspcall : dsp-rsp: %s\n", this->c_name(), status_to_str(rsp.status));
-            // TODO: handle errors
+            // the batch output is undefined at this point, continuing would produce garbage results
+            GGML_ABORT("ggml-hex: %s dspcall : dsp-rsp: %s (batch of %u ops)\n", this->c_name(), status_to_str(rsp.status), rsp.n_ops);
         }
 
         op_queue->pop(rsp, dbuf);
@@ -2775,8 +2794,20 @@ void ggml_hexagon_session::flush_pending(bool all) {
 void ggml_hexagon_session::flush_batch(size_t min_ops) {
     if (op_batch->n_ops < min_ops) { return; }
 
-    // copies from other sessions must land before the ops that consume them start
+    // data produced by other sessions must land before the ops that consume it start
+    std::unordered_set<ggml_hexagon_session *> producers = drain_peers;
     flush_drain_peers();
+
+    // sessions still reading our buffers must finish before this batch overwrites them
+    flush_wait_peers();
+
+    // a peer flush above can re-enter this session and push our batch already
+    if (op_batch->n_ops < min_ops) { return; }
+
+    // the producers must wait for this batch before they reuse the buffers we read
+    for (auto * peer : producers) {
+        peer->add_wait_peer(this);
+    }
 
     htp_opbatch_req req {};
     dspqueue_buffer dbuf{};
@@ -2799,7 +2830,7 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
 
 void ggml_hexagon_session::flush(bool all) {
     flush_sync_peers();
-    // also when there is nothing to push: the host may be about to read a tensor another session is copying into
+    // also when there is nothing to push: the host may be about to read a tensor another session is writing
     flush_drain_peers();
     flush_batch();
     flush_pending(all);
@@ -2808,15 +2839,22 @@ void ggml_hexagon_session::flush(bool all) {
 void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
     for (auto t : node.get_inputs()) {
         if (t && t->buffer && ggml_backend_buffer_is_hexagon(t->buffer)) {
-            if (ggml_backend_hexagon_buffer_get_sess(t->buffer) != this) {
-                this->clone_buffer(static_cast<const ggml_hexagon_shared_buffer *>(t->buffer->context));
+            auto peer = ggml_backend_hexagon_buffer_get_sess(t->buffer);
+            if (peer != this) {
+                // the op would read unmapped memory: fail loudly instead of computing garbage
+                if (!this->clone_buffer(static_cast<const ggml_hexagon_shared_buffer *>(t->buffer->context))) {
+                    GGML_ABORT("ggml-hex: %s cannot map %s buffer for %s\n", this->c_name(), peer->c_name(), node.node->name);
+                }
+                this->add_drain_peer(peer);
             }
         }
     }
     for (auto t : node.get_outputs()) {
         if (t && t->buffer && ggml_backend_buffer_is_hexagon(t->buffer)) {
             if (ggml_backend_hexagon_buffer_get_sess(t->buffer) != this) {
-                this->clone_buffer(static_cast<const ggml_hexagon_shared_buffer *>(t->buffer->context));
+                if (!this->clone_buffer(static_cast<const ggml_hexagon_shared_buffer *>(t->buffer->context))) {
+                    GGML_ABORT("ggml-hex: %s cannot map output buffer for %s\n", this->c_name(), node.node->name);
+                }
             }
         }
     }
@@ -5555,6 +5593,14 @@ static bool ggml_backend_hexagon_cpy_tensor_async(ggml_backend_t backend_src, gg
         return false;
     }
 
+    // mirror the cases the DSP CPY op handles (htp/cpy-ops.c): f32/f16 only, same type or same shape
+    const bool src_ok = src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16;
+    const bool dst_ok = dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16;
+    const bool same_shape = ggml_are_same_shape(src, dst) && !ggml_is_transposed(src) && !ggml_is_transposed(dst);
+    if (!src_ok || !dst_ok || (src->type != dst->type && !same_shape)) {
+        return false;
+    }
+
     *(ggml_hexagon_tensor_extra *) dst->extra = *(const ggml_hexagon_tensor_extra *) src->extra;
 
     auto sess_src = static_cast<ggml_hexagon_session *>(backend_src->context);
@@ -5856,12 +5902,43 @@ static bool ggml_hexagon_supported_fill(const struct ggml_hexagon_session * sess
     GGML_UNUSED(sess);
 }
 
+// True when the buffer belongs to another hexagon device. Decided from the buffer type, not the
+// session: llama probes weights with dummy buffers that have no session context yet.
+static bool ggml_hexagon_buffer_is_foreign(const ggml_backend_hexagon_device_context * dev_ctx, const ggml_backend_buffer_t buffer) {
+    if (!buffer || !ggml_backend_buffer_is_hexagon(buffer)) {
+        return false;
+    }
+    auto buft_ctx = static_cast<const ggml_backend_hexagon_buffer_type_context *>(buffer->buft->context);
+    return buft_ctx->dev_ctx != dev_ctx;
+}
+
+// An op runs on the device that owns its weights and its pre-allocated output (e.g. the KV cache).
+// Other inputs may live in another session on the same NPU (see ggml_backend_hexagon_device_supports_buft).
+static bool ggml_hexagon_op_is_local(const ggml_backend_hexagon_device_context * dev_ctx, const struct ggml_tensor * op) {
+    const ggml_tensor * out = op->view_src ? op->view_src : op;
+    if (ggml_hexagon_buffer_is_foreign(dev_ctx, out->buffer)) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        const ggml_tensor * src = op->src[i];
+        if (!src || !src->buffer || src->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) continue;
+        if (ggml_hexagon_buffer_is_foreign(dev_ctx, src->buffer)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
     auto sess    = dev_ctx->session();
 
     // reject ops that match the filter
     if (opt_opfilter && std::regex_match(ggml_op_desc(op), *opt_opfilter)) {
+        return false;
+    }
+
+    if (!ggml_hexagon_op_is_local(dev_ctx, op)) {
         return false;
     }
 
@@ -6034,13 +6111,15 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 static bool ggml_backend_hexagon_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
 
-    // Technically we can clone hexagon buffers from any session but for some reason the output is garbled with layer-split,
-    // tensor-split works correctly, so it needs mode debugging and investigation. For now accept only our own buffers.
-#if 0
-    bool supp = (buft->iface.get_alignment == ggml_backend_hexagon_buffer_type_get_alignment);
-#else
     bool supp = (buft == &dev_ctx->host_buffer_type) || (buft == &dev_ctx->buffer_type);
-#endif
+
+    // Buffers of other sessions on the same physical NPU are readable (enqueue_op maps them with clone_buffer
+    // and orders the batches with drain/wait peers), so the scheduler does not need to copy them.
+    // Weights and pre-allocated outputs still run on their own session, see ggml_hexagon_op_is_local.
+    if (!supp && buft->iface.get_alignment == ggml_backend_hexagon_buffer_type_get_alignment) {
+        auto peer_ctx = static_cast<ggml_backend_hexagon_buffer_type_context *>(buft->context)->dev_ctx;
+        supp = peer_ctx->config.physical_idx == dev_ctx->config.physical_idx;
+    }
 
     HEX_VERBOSE("ggml-hex: %s device-supports-buft %s %s\n", dev_ctx->c_name(), ggml_backend_buft_name(buft), supp ? "yes" : "no");
     return supp;
