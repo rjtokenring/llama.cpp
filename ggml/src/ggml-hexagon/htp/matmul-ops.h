@@ -25,17 +25,10 @@ extern "C" {
 #define HTP_MM_WEIGHT_TILE_SIZE_Q8_0   1088
 #define HTP_MM_WEIGHT_TILE_SIZE_IQ4_NL 576
 #define HTP_MM_WEIGHT_TILE_SIZE_MXFP4  544
-// Q6_K tile for a 32-row x 32-k block (native 6-bit, no expansion to Q8_0). 896 bytes total
-// (7 bits/element vs 8.5 for the Q8_0 repack). Laid out "vrmpy-ready": vrmpy computes
-// acc[w] += sum_{b<4} Vu[4w+b]*Vv[4w+b], so byte 4*row+b of each 128-byte vector holds the
-// weight for (row, k = 4*group + b). That lets the kernel unpack with plain elementwise
-// and/shift/or ops and needs no cross-lane shuffles (see tiled_vec_dot_q6_k_32x1).
-//   [0..511]   low 4 bits : 4 vectors; vector i packs k-group 2i in the low nibble and
-//                           group 2i+1 in the high nibble
-//   [512..767] high 2 bits: 2 vectors; vector m packs k-group 4m+j at bit offset 2j
-//   [768..895] eff scales : 32 fp16 for k 0..15, then 32 fp16 for k 16..31 (one per row)
-//                           eff_scale = d_q6 * scales[sub16], folding the per-256 super-scale
-//                           and the per-16 int8 sub-scale into one value
+// Q6_K native 6-bit tile (32 rows x 32 k), vrmpy-ready: byte 4*row+b of a vector holds k = 4*group+b
+//   vectors 0..3: low nibbles, vector i holds group 2i (low nibble) and group 2i+1 (high nibble)
+//   vectors 4..5: high 2 bits, vector m holds groups 4m..4m+3 at bit offsets 0,2,4,6
+//   vector 6: fp16 scales per row, d * scales[]: k 0..15 in lanes 0..31, k 16..31 in lanes 32..63
 #define HTP_MM_WEIGHT_TILE_SIZE_Q6_K   896
 
 // --- Weight Repacked Aligned Tile Sizes ---
