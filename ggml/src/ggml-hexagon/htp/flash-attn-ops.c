@@ -361,6 +361,8 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
         const HVX_Vector vinf      = Q6_Vh_vsplat_R(0xFC00);
         const HVX_Vector vmin      = Q6_Vh_vsplat_R(0xFBFF);
         const HVX_Vector v_log2e   = hvx_vec_splat_f16(EXP_LOG2E_F);
+        const HVX_Vector v_one_f32  = hvx_vec_splat_f32(1.0f);
+        const HVX_Vector v_ms_floor = hvx_vec_splat_f32(-80.0f); // exp underflows to 0 well before this
         const uint32_t stride_v2   = factx->size_v_row_padded * 2;
         for (uint32_t ib = 0; ib < factx->n_blocks; ++ib) {
             const uint32_t ic_start = ib * FLASH_ATTN_BLOCK_SIZE;
@@ -452,10 +454,11 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
                 HVX_Vector M_new_vec = Q6_Vsf_vmax_VsfVsf(v_max, M_vec);
                 HVX_Vector diff_vec  = HVX_OP_SUB_F32(M_vec, M_new_vec);
 
-                HVX_Vector diff_f16   = hvx_vec_f32_to_f16(diff_vec, diff_vec);
-                HVX_Vector diff_base2 = hvx_vec_mul_f16_f16(diff_f16, v_log2e);
-                HVX_Vector ms_f16     = hvx_vec_exp2_f16(diff_base2);
-                HVX_Vector ms_vec     = Q6_V_lo_W(hvx_vec_f16_to_f32(ms_f16));
+                // Rescale factor ms = exp(M_old - M_new) in FP32. It multiplies the accumulator and the running sum on
+                // every block, so its error compounds over the whole sequence: the FP16 exp2 returns 1 + 2^-10 for an
+                // unchanged max, which after 256 blocks (16k kv) weights the first keys ~29% more than the last ones.
+                HVX_Vector ms_vec = hvx_vec_exp_f32(Q6_Vsf_vmax_VsfVsf(diff_vec, v_ms_floor));
+                ms_vec            = Q6_V_vmux_QVV(Q6_Q_vcmp_eq_VwVw(diff_vec, Q6_V_vzero()), v_one_f32, ms_vec);
 
                 M_vec = M_new_vec;
 
@@ -1438,6 +1441,15 @@ static inline void fa_softmax_impl(
         HVX_VectorPair exp_m_diff_pair = hvx_vec_f16_to_f32(exp_m_diff_f16);
         HVX_Vector exp_m_diff0 = Q6_V_lo_W(exp_m_diff_pair);
         HVX_Vector exp_m_diff1 = Q6_V_hi_W(exp_m_diff_pair);
+
+        // The FP16 exp2 returns 1 + 2^-10 for a zero argument; this factor rescales the running state on every step,
+        // so force it to exactly 1 when the row max did not change (the common case) to stop the error compounding.
+        {
+            const HVX_Vector v_zero = Q6_V_vzero();
+            const HVX_Vector v_one  = hvx_vec_splat_f32(1.0f);
+            exp_m_diff0 = Q6_V_vmux_QVV(Q6_Q_vcmp_eq_VwVw(v_m_diff0, v_zero), v_one, exp_m_diff0);
+            exp_m_diff1 = Q6_V_vmux_QVV(Q6_Q_vcmp_eq_VwVw(v_m_diff1, v_zero), v_one, exp_m_diff1);
+        }
 
         HVX_VectorPair rowsum_acc_pair = hvx_vec_f16_to_f32(rowsum_acc_v);
         HVX_Vector     v_rowsum_acc_f32_0 = Q6_V_lo_W(rowsum_acc_pair);

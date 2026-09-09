@@ -10668,6 +10668,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {2, 1}, 1024,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
+    // long-context decode shapes on quantized K/V (exact f32 reference on the CPU): the online-softmax rescale factor
+    // is applied once per block, so its error compounds with the number of blocks and only shows from ~8k kv
+    for (int kv : {8192, 16384}) {
+        for (bool mask : {true, false}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1},  kv, 1, mask, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, kv, 1, mask, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
