@@ -261,9 +261,6 @@ static inline size_t ggml_hexagon_tiled_row_size(enum ggml_type type, int64_t ne
 }
 
 static inline bool ggml_hexagon_is_hmx_weight_type(enum ggml_type type) {
-    if (type == GGML_TYPE_Q6_K) {
-        return false;  // HVX kernel only, no HMX tile format
-    }
     return type == GGML_TYPE_F16 || type == GGML_TYPE_F32 || ggml_hexagon_is_repack_type(type);
 }
 
@@ -5244,8 +5241,8 @@ static bool is_supported_mul_mat_nx_kernel(const ggml_tensor * src0, const struc
         return kparams->kernel_type == HTP_MM_KERNEL_HMX_2D;
     }
 
-    if (!ggml_hexagon_is_repack_type(src0->type)) {
-        return false;
+    if (!ggml_hexagon_is_repack_type(src0->type) || src0->type == GGML_TYPE_Q6_K) {
+        return false;  // Q6_K has no fused HVX kernel
     }
 
     return kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW || kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT;
@@ -5270,13 +5267,12 @@ static bool is_mergeable_mul_mat(const ggml_tensor * t) {
     const ggml_tensor * src1 = t->src[1];
     if (src1->type != GGML_TYPE_F32) return false;
     if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
-    if (src0->type == GGML_TYPE_Q6_K) return false;  // no merged (nx) kernel for Q6_K
 
     if (mm_is_hmx_eligible(t)) {
         return ggml_hexagon_is_hmx_weight_type(src0->type);
     }
 
-    return ggml_hexagon_is_repack_type(src0->type);
+    return ggml_hexagon_is_repack_type(src0->type) && src0->type != GGML_TYPE_Q6_K;
 }
 
 static bool is_mergeable_mul_mat_pair(const ggml_tensor * n1, const ggml_tensor * n2) {
