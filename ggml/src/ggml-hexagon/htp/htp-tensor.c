@@ -104,6 +104,12 @@ void htp_tensor_dirty_all(struct htp_context * ctx, const struct htp_tensor * co
             continue;
         }
 
+        // small outputs: flush inline instead of paying the range merge on every op
+        if (t->size <= HEX_L2_FLUSH_IL_THRESHOLD) {
+            hex_l2flush((void *) (uintptr_t) t->data, t->size);
+            continue;
+        }
+
         uint32_t t_start = t->data;
         uint32_t t_end   = t_start + t->size;
 
