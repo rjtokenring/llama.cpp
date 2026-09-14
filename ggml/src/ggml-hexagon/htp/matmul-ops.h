@@ -36,6 +36,10 @@ extern "C" {
 //   vector 4: high bit, bit g of a byte holds the 5th bit of group g
 //   vector 5: fp16 per row, lane 2*row = d * scale, lane 2*row+1 = -(dmin * min)
 #define HTP_MM_WEIGHT_TILE_SIZE_Q5_K   768
+// Q4_K native 4-bit tile (32 rows x 32 k): the Q5_K tile without the high-bit plane.
+//   vectors 0..3: low nibbles, vector i holds group 2i (low nibble) and group 2i+1 (high nibble)
+//   vector 4: fp16 per row, lane 2*row = d * scale, lane 2*row+1 = -(dmin * min)
+#define HTP_MM_WEIGHT_TILE_SIZE_Q4_K   640
 
 // --- Weight Repacked Aligned Tile Sizes ---
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0   640
@@ -45,6 +49,7 @@ extern "C" {
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_MXFP4  640
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q6_K   896
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q5_K   768
+#define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_K   640
 
 // --- Activation Tiled Block Sizes (including padding) ---
 #define HTP_MM_ACT_TILE_SIZE_Q8_0      1152
@@ -210,6 +215,7 @@ static inline bool htp_mm_is_repack_type(int weight_type) {
         case HTP_TYPE_Q8_0:
         case HTP_TYPE_IQ4_NL:
         case HTP_TYPE_MXFP4:
+        case HTP_TYPE_Q4_K:
         case HTP_TYPE_Q5_K:
         case HTP_TYPE_Q6_K:
             return true;
@@ -221,7 +227,7 @@ static inline bool htp_mm_is_repack_type(int weight_type) {
 // Affine types (w = d * q + m) need the sum of the activations to apply the min,
 // so their activations are quantized to Q8_1 instead of Q8_0.
 static inline bool htp_mm_weight_has_min(int weight_type) {
-    return weight_type == HTP_TYPE_Q4_1 || weight_type == HTP_TYPE_Q5_K;
+    return weight_type == HTP_TYPE_Q4_1 || weight_type == HTP_TYPE_Q4_K || weight_type == HTP_TYPE_Q5_K;
 }
 
 // --- Tile Size Helpers ---
@@ -234,6 +240,8 @@ static inline uint32_t htp_mm_get_weight_tile_size(int weight_type) {
             return HTP_MM_WEIGHT_TILE_SIZE_Q4_1;
         case HTP_TYPE_Q8_0:
             return HTP_MM_WEIGHT_TILE_SIZE_Q8_0;
+        case HTP_TYPE_Q4_K:
+            return HTP_MM_WEIGHT_TILE_SIZE_Q4_K;
         case HTP_TYPE_Q5_K:
             return HTP_MM_WEIGHT_TILE_SIZE_Q5_K;
         case HTP_TYPE_Q6_K:
@@ -254,6 +262,8 @@ static inline uint32_t htp_mm_get_weight_aligned_tile_size(int weight_type) {
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_1;
         case HTP_TYPE_Q8_0:
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q8_0;
+        case HTP_TYPE_Q4_K:
+            return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_K;
         case HTP_TYPE_Q5_K:
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q5_K;
         case HTP_TYPE_Q6_K:
@@ -307,6 +317,7 @@ static inline size_t htp_mm_get_tiled_row_stride(int weight_type, uint32_t k) {
         case HTP_TYPE_IQ4_NL:
         case HTP_TYPE_Q4_1:
         case HTP_TYPE_Q8_0:
+        case HTP_TYPE_Q4_K:
         case HTP_TYPE_Q5_K:
         case HTP_TYPE_Q6_K:
         case HTP_TYPE_MXFP4:
