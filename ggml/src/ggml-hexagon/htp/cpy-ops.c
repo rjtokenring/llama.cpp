@@ -183,6 +183,28 @@ static void cpy_thread_##NAME##_reshape(unsigned int nth, unsigned int ith, void
 DEFINE_CPY_RESHAPE(f32,  float, 4)
 DEFINE_CPY_RESHAPE(f16, __fp16, 2)
 
+// Both tensors contiguous: the reshape does not move any byte around, so copy the flat run.
+// Scalar on purpose: this runs on every worker of every session, and the vector helpers read past the
+// end of the source and need an HVX context, which is scarce when several sessions share the device.
+static void cpy_thread_flat(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_copy_context * ct = (struct htp_copy_context *) data;
+    struct htp_ops_context * octx = ct->octx;
+    cpy_preamble;
+
+    const uint32_t th_nelem = ct->elem_per_thread;
+    const uint32_t th_start = ct->elem_start + ith * th_nelem;
+    const uint32_t th_end   = MIN(th_start + th_nelem, ct->elem_start + ct->nelem);
+    if (th_start >= th_end) {
+        return;
+    }
+
+    const size_t elem_size = ct->dst_type_size;
+    const size_t offset    = (size_t) th_start * elem_size;
+
+    memcpy((uint8_t *) dst->data + offset, (const uint8_t *) src0->data + offset,
+           (size_t) (th_end - th_start) * elem_size);
+}
+
 static void cpy_thread_f16_f32_sameshape(unsigned int nth, unsigned int ith, void * data) {
     struct htp_copy_context * ct = (struct htp_copy_context *) data;
     struct htp_ops_context * octx = ct->octx;
@@ -327,7 +349,14 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
 
     const uint32_t n_threads = octx->n_threads;
 
-    const bool dst_is_contiguous = htp_tensor_is_contiguous(dst, ct.dst_type_size);
+    const bool dst_is_contiguous  = htp_tensor_is_contiguous(dst, ct.dst_type_size);
+    const bool src0_is_contiguous = htp_tensor_is_contiguous(src0, ct.src0_type_size);
+
+    // A copy between two contiguous tensors of the same type is a flat run of bytes even when the shapes
+    // differ, e.g. storing a 3D recurrent state into a flat cache view. Those would otherwise walk the
+    // generic reshape loop one element at a time.
+    const bool flat = sametype && !sameshape && src0_is_contiguous && dst_is_contiguous &&
+                      (ne00 * ne01 * ne02 * ne03) == (ne0 * ne1 * ne2 * ne3);
 
     if (sameshape) {
         const uint32_t total_rows = ne01 * ne02 * ne03;
@@ -400,7 +429,12 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
         ct.nelem           = nelem;
         ct.elem_per_thread = fastdiv(nelem + n_threads - 1, &octx->n_threads_div);
 
-        work_queue_func_t copy_fun = (src0->type == HTP_TYPE_F32) ? cpy_thread_f32_reshape : cpy_thread_f16_reshape;
+        work_queue_func_t copy_fun;
+        if (flat) {
+            copy_fun = cpy_thread_flat;
+        } else {
+            copy_fun = (src0->type == HTP_TYPE_F32) ? cpy_thread_f32_reshape : cpy_thread_f16_reshape;
+        }
         work_queue_run(octx->ctx->work_queue, copy_fun, &ct, n_threads);
     } else {
         return HTP_STATUS_NO_SUPPORT;
