@@ -602,7 +602,10 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
     const float scale = 1.0f / sqrtf((float) S_v);
 
     float * dst_base       = (float *) (uintptr_t) dst->data;
-    float * state_out_base = dst_base + (uint64_t) S_v * H * n_tokens * n_seqs;
+    // When the graph copy into the recurrent cache is fused away, the state goes straight there
+    // instead of into the tail of our own output.
+    float * state_out_base = (octx->dsts[1] != NULL) ? (float *) (uintptr_t) octx->dsts[1]->data
+                                                     : dst_base + (uint64_t) S_v * H * n_tokens * n_seqs;
     const float * state_in_base = (const float *) (uintptr_t) state->data;
 
     const bool kda = (g->ne[0] == S_v);
@@ -868,7 +871,10 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
     const float scale = 1.0f / sqrtf((float) S_v);
 
     float * dst_base       = (float *) (uintptr_t) dst->data;
-    float * state_out_base = dst_base + (uint64_t) S_v * H * n_seqs;
+    // When the graph copy into the recurrent cache is fused away, the state goes straight there
+    // instead of into the tail of our own output.
+    float * state_out_base = (octx->dsts[1] != NULL) ? (float *) (uintptr_t) octx->dsts[1]->data
+                                                     : dst_base + (uint64_t) S_v * H * n_seqs;
     const float * state_in_base = (const float *) (uintptr_t) state->data;
 
     const bool kda = (g->ne[0] == S_v);
