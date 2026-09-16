@@ -113,6 +113,7 @@ enum ggml_hexagon_fusion_flags {
     GGML_HEXAGON_FUSE_MUL_MAT_ADD   = (1 << 3), // 8
     GGML_HEXAGON_FUSE_MUL_MAT_NX    = (1 << 4), // 16
     GGML_HEXAGON_FUSE_MUL_MAT_ID_NX = (1 << 5), // 32
+    GGML_HEXAGON_FUSE_GDN_CACHE     = (1 << 6), // 64
 };
 
 static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
@@ -3205,6 +3206,61 @@ struct ggml_hexagon_opbatch {
         return false;
     }
 
+    // GATED_DELTA_NET packs [attention | new state] into one output because a ggml op has a single dst,
+    // so the graph copies the state half into the recurrent cache right after. Give the op the cache as a
+    // second destination and let it write the state there directly, then drop the copy.
+    bool try_fuse_gdn_cache(const htp_opnode & node) {
+        if (n_ops == 0) return false;
+        if (node.opcode != HTP_OP_CPY) return false;
+
+        htp_opnode & last_node = ops[n_ops - 1];
+        if (last_node.opcode != HTP_OP_GATED_DELTA_NET) return false;
+
+        const ggml_tensor * gdn_dst = last_node.dst();
+        const ggml_tensor * state   = node.src0();
+        const ggml_tensor * cache   = node.dst();
+
+        // The op leaves the attention half of its output alone when it writes the state elsewhere, and the
+        // copy disappears, so neither may be something the caller reads back.
+        if (gdn_dst->flags & GGML_TENSOR_FLAG_OUTPUT) return false;
+        if (cache->flags & GGML_TENSOR_FLAG_OUTPUT) return false;
+
+        // The copy has to be exactly the tail of the op output, laid out linearly on both sides.
+        if (state->view_src != gdn_dst) return false;
+        if (state->type != GGML_TYPE_F32 || cache->type != GGML_TYPE_F32) return false;
+        if (!ggml_is_contiguous(state) || !ggml_is_contiguous(cache)) return false;
+        if (ggml_nbytes(state) != ggml_nbytes(cache)) return false;
+        if (state->view_offs + ggml_nbytes(state) != ggml_nbytes(gdn_dst)) return false;
+
+        // One sequence, and a cache destination that is a single flat row: that rules out the rollback
+        // path, whose snapshots make both sides three-dimensional.
+        if (state->ne[3] != 1) return false;
+        if (cache->ne[1] != 1 || cache->ne[2] != 1 || cache->ne[3] != 1) return false;
+
+        size_t extra_bufs = 0, extra_vmem = 0, extra_tens = 0;
+        if (!t_map.count(cache)) {
+            extra_tens++;
+            auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(cache->buffer->context);
+            if (!b_map.count(sbuf->fd())) {
+                extra_vmem += sbuf->size();
+                extra_bufs += 1;
+            }
+        }
+        if ((extra_bufs + n_bufs) > n_bufs_max || (extra_tens + n_tens) > n_tens_max || (extra_vmem + b_vmem) > b_vmem_max) {
+            return false;
+        }
+
+        last_node.name = "GATED_DELTA_NET+CPY";
+        last_node.outputs.push_back(cache);
+        last_node.fused.push_back(node.node);
+
+        htp_op_desc & o = h_ops[n_ops - 1];
+        o.dst[1] = add_tensor(cache);
+
+        HEX_VERBOSE("ggml-hex: %s fused GATED_DELTA_NET+CPY (#%u)\n", sess->c_name(), n_ops - 1);
+        return true;
+    }
+
     bool try_fuse(const htp_opnode & node) {
         if (!opt_opfusion) return false;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_ALLREDUCE_ADD) && try_fuse_allreduce_add(node)) return true;
@@ -3212,6 +3268,7 @@ struct ggml_hexagon_opbatch {
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ADD)   && try_fuse_mul_mat_add(node))   return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_NX)    && try_fuse_mul_mat_nx(node))    return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ID_NX) && try_fuse_mul_mat_id_nx(node)) return true;
+        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_GDN_CACHE)     && try_fuse_gdn_cache(node))     return true;
         return false;
     }
 };
