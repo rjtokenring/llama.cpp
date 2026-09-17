@@ -204,7 +204,8 @@ static void ggml_hexagon_dump_op_prof(const std::string &sess_name, const htp_op
             node.op_name().c_str(), fmt.names, fmt.dims, fmt.types, fmt.strides, fmt.kparams, op_usec, op_cycles, pd.cycles_start, mhz, pmu_str);
 }
 
-static void ggml_hexagon_dump_batch_prof(const std::string & sess_name, const htp_opbatch_rsp & rsp) {
+static void ggml_hexagon_dump_batch_prof(const std::string & sess_name, const htp_opbatch_rsp & rsp,
+                                         uint64_t host_usec, int64_t gap_usec) {
     uint64_t batch_cycles = rsp.cycles_stop - rsp.cycles_start;
     float batch_mhz = rsp.usecs > 0 ? (float) batch_cycles / rsp.usecs : 0.0f;
 
@@ -216,8 +217,11 @@ static void ggml_hexagon_dump_batch_prof(const std::string & sess_name, const ht
                 rsp.n_traces[8], rsp.n_traces[9], rsp.n_traces[10]);
     }
 
-    GGML_LOG_DEBUG("ggml-hex: %s profile-op OPBATCH|----|n-ops %u|%s|----|----|usec %u cycles %llu start %llu mhz %.1f\n",
-                   sess_name.c_str(), rsp.n_ops, evt_str, rsp.usecs, (unsigned long long) batch_cycles, (unsigned long long) rsp.cycles_start, batch_mhz);
+    // host-usec/gap-usec are appended after mhz on purpose: scripts/snapdragon/ggml-hexagon-profile.py splits
+    // the line on '|' and only accepts 6 or 7 fields, while its timing regex ignores any trailing text.
+    GGML_LOG_DEBUG("ggml-hex: %s profile-op OPBATCH|----|n-ops %u|%s|----|----|usec %u cycles %llu start %llu mhz %.1f host-usec %llu gap-usec %lld\n",
+                   sess_name.c_str(), rsp.n_ops, evt_str, rsp.usecs, (unsigned long long) batch_cycles, (unsigned long long) rsp.cycles_start, batch_mhz,
+                   (unsigned long long) host_usec, (long long) gap_usec);
 }
 
 static void ggml_hexagon_dump_trace_events(const std::string & sess_name, const htp_opbatch_rsp & rsp,
@@ -440,6 +444,15 @@ struct ggml_hexagon_session {
 
     std::atomic<uint64_t> batch_req_seq{0};
     std::atomic<uint64_t> batch_rsp_seq{0};
+
+    // Op batch accounting, only maintained while GGML_HEXAGON_PROFILE is on, reported at session teardown.
+    // dsp_usec is what the DSP reports for the batch, host_usec is submit-to-completion wall time on the host,
+    // so host_usec - dsp_usec is the queueing and signaling overhead. wait_usec is the time the host thread
+    // actually spent blocked in dspqueue_read.
+    uint64_t prof_n_batches = 0;
+    uint64_t prof_dsp_usec  = 0;
+    uint64_t prof_host_usec = 0;
+    uint64_t prof_wait_usec = 0;
     std::atomic<uint32_t> last_error{HTP_STATUS_OK};
 
     uint64_t                cached_uid = 0;
@@ -3175,7 +3188,12 @@ struct ggml_hexagon_opqueue {
             }
 
             if (opt_profile) {
-                ggml_hexagon_dump_batch_prof(shm_buf->sess->name, rsp);
+                const uint64_t host_usec = (uint64_t) (ggml_time_us() - (int64_t) start_usec[slot]);
+                ggml_hexagon_session * sess = shm_buf->sess;
+                sess->prof_n_batches++;
+                sess->prof_dsp_usec  += rsp.usecs;
+                sess->prof_host_usec += host_usec;
+                ggml_hexagon_dump_batch_prof(sess->name, rsp, host_usec, (int64_t) host_usec - (int64_t) rsp.usecs);
             }
 
             for (uint32_t i = 0; i < rsp.n_ops; i++) {
@@ -3233,7 +3251,13 @@ void ggml_hexagon_session::flush_pending(bool all) {
         // Read response packet from queue
         const uint32_t timeo = opt_oppoll ? 0 : DSPQUEUE_TIMEOUT;
 
+        const int64_t wait_start = opt_profile ? ggml_time_us() : 0;
+
         int err = dspqueue_read(this->queue, &flags, 1, &n_dbufs, &dbuf, sizeof(rsp), &rsp_size, (uint8_t *) &rsp, timeo);
+
+        if (opt_profile) {
+            this->prof_wait_usec += (uint64_t) (ggml_time_us() - wait_start);
+        }
         if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK) {
             continue;
         }
@@ -3895,6 +3919,17 @@ void ggml_hexagon_session::release() noexcept(true) {
     this->mdev.sessions.clear();
 
     int err;
+
+    if (opt_profile && this->prof_n_batches) {
+        const uint64_t n = this->prof_n_batches;
+        GGML_LOG_INFO("ggml-hex: %s profile-summary : batches %llu : dsp-usec %llu (avg %llu) : host-usec %llu (avg %llu) : gap-usec %lld (avg %lld) : read-wait-usec %llu\n",
+                      this->c_name(), (unsigned long long) n,
+                      (unsigned long long) this->prof_dsp_usec,  (unsigned long long) (this->prof_dsp_usec / n),
+                      (unsigned long long) this->prof_host_usec, (unsigned long long) (this->prof_host_usec / n),
+                      (long long) ((int64_t) this->prof_host_usec - (int64_t) this->prof_dsp_usec),
+                      (long long) (((int64_t) this->prof_host_usec - (int64_t) this->prof_dsp_usec) / (int64_t) n),
+                      (unsigned long long) this->prof_wait_usec);
+    }
 
     if (this->valid_iface) {
         // Stop dspqueue/opbatch processing
