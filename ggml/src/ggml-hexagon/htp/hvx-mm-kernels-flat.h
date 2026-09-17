@@ -256,24 +256,36 @@ static inline void quantize_f16_f16_flat_kernel(
 
 // Dot kernels that consume flat (non-tiled) activations
 
+// vdelta control that spreads bytes 4g..4g+3 of a vector over all 32 lanes (4 bytes each) once the vector is rotated by 4g
+static const uint8_t __attribute__((aligned(128))) flat_act_repl_ctrl[128] = {
+    0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
+    0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
+    0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
+    0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
+    0x40, 0x40, 0x40, 0x40, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
+    0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
+    0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
+    0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
+};
+
+// The flat Q8 activations keep the 32 values of k-tile kt contiguous. Replicate them into the 8 vrmpy operands
+// (one per 4-k group, the value of k in all 32 row lanes) that the tiled accumulators expect.
+static inline void flat_replicate_act_32(const uint8_t * restrict y_q, uint32_t kt, HVX_Vector * restrict v_act_rep) {
+    const HVX_Vector v_repl_ctrl = *(const HVX_Vector *) flat_act_repl_ctrl;
+    const HVX_Vector v_act_raw   = Q6_V_vror_VR(*(const HVX_Vector *) (y_q + (kt / 4) * 128), (kt % 4) * 32);
+
+    #pragma unroll
+    for (int g = 0; g < 8; g++) {
+        v_act_rep[g] = Q6_V_vdelta_VV(g ? Q6_V_vror_VR(v_act_raw, 4 * g) : v_act_raw, v_repl_ctrl);
+    }
+}
+
 static void flat_vec_dot_q4_0_32x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy, uint32_t valid_rows, const float * restrict sz) {
     const uint8_t * restrict tile_ptr = vx;
     const uint8_t * restrict y_q = vy;
 
     HVX_Vector v_sum_float = Q6_V_vzero();
     HVX_Vector i8 = Q6_Vb_vsplat_R(8);
-
-    static const uint8_t __attribute__((aligned(128))) repl[128] = {
-        0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x40, 0x40, 0x40, 0x40, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-    };
-    HVX_Vector v_repl_ctrl = * (const HVX_Vector *) repl;
 
     const uint32_t quants_size = hex_round_up(n, 128);
     const __fp16 * restrict y_scales = (const __fp16 *) (y_q + quants_size);
@@ -282,21 +294,8 @@ static void flat_vec_dot_q4_0_32x1(const uint32_t n, float * restrict s, const v
     for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 640);
 
-        uint32_t block_idx = kt / 4;
-        uint32_t sub_idx = kt % 4;
-
-        HVX_Vector vx_i8 = * (const HVX_Vector *) (y_q + block_idx * 128);
-        HVX_Vector v_act_raw = Q6_V_vror_VR(vx_i8, sub_idx * 32);
-
         HVX_Vector v_act_rep[8];
-        v_act_rep[0] = Q6_V_vdelta_VV(v_act_raw, v_repl_ctrl);
-        v_act_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 4), v_repl_ctrl);
-        v_act_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 8), v_repl_ctrl);
-        v_act_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 12), v_repl_ctrl);
-        v_act_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 16), v_repl_ctrl);
-        v_act_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 20), v_repl_ctrl);
-        v_act_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 24), v_repl_ctrl);
-        v_act_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y_q, kt, v_act_rep);
 
         HVX_Vector v_sum = accum_4bit_32x1(vptr, v_act_rep, i8);
         HVX_Vector v_sum_sf = Q6_Vsf_equals_Vw(v_sum);
@@ -328,18 +327,6 @@ static void flat_vec_dot_q4_0_32x2(const uint32_t n, float * restrict s0, float 
     HVX_Vector v_sum_float_c1 = Q6_V_vzero();
     HVX_Vector i8 = Q6_Vb_vsplat_R(8);
 
-    static const uint8_t __attribute__((aligned(128))) repl[128] = {
-        0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x40, 0x40, 0x40, 0x40, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-    };
-    HVX_Vector v_repl_ctrl = * (const HVX_Vector *) repl;
-
     const uint32_t quants_size = hex_round_up(n, 128);
     const __fp16 * restrict y0_scales = (const __fp16 *) (y0_q + quants_size);
     const __fp16 * restrict y1_scales = (const __fp16 *) (y1_q + quants_size);
@@ -348,34 +335,11 @@ static void flat_vec_dot_q4_0_32x2(const uint32_t n, float * restrict s0, float 
     for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 640);
 
-        uint32_t block_idx = kt / 4;
-        uint32_t sub_idx = kt % 4;
-
-        HVX_Vector vx0_i8 = * (const HVX_Vector *) (y0_q + block_idx * 128);
-        HVX_Vector vx1_i8 = * (const HVX_Vector *) (y1_q + block_idx * 128);
-
-        HVX_Vector v_act0_raw = Q6_V_vror_VR(vx0_i8, sub_idx * 32);
-        HVX_Vector v_act1_raw = Q6_V_vror_VR(vx1_i8, sub_idx * 32);
-
         HVX_Vector v_act0_rep[8];
-        v_act0_rep[0] = Q6_V_vdelta_VV(v_act0_raw, v_repl_ctrl);
-        v_act0_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 4), v_repl_ctrl);
-        v_act0_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 8), v_repl_ctrl);
-        v_act0_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 12), v_repl_ctrl);
-        v_act0_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 16), v_repl_ctrl);
-        v_act0_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 20), v_repl_ctrl);
-        v_act0_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 24), v_repl_ctrl);
-        v_act0_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y0_q, kt, v_act0_rep);
 
         HVX_Vector v_act1_rep[8];
-        v_act1_rep[0] = Q6_V_vdelta_VV(v_act1_raw, v_repl_ctrl);
-        v_act1_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 4), v_repl_ctrl);
-        v_act1_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 8), v_repl_ctrl);
-        v_act1_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 12), v_repl_ctrl);
-        v_act1_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 16), v_repl_ctrl);
-        v_act1_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 20), v_repl_ctrl);
-        v_act1_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 24), v_repl_ctrl);
-        v_act1_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y1_q, kt, v_act1_rep);
 
         HVX_VectorPair v_sums = accum_4bit_32x2(vptr, v_act0_rep, v_act1_rep, i8);
         HVX_Vector v_sum_c0 = Q6_V_lo_W(v_sums);
@@ -419,18 +383,6 @@ static void flat_vec_dot_q4_1_32x1(const uint32_t n, float * restrict s, const v
 
     HVX_Vector v_sum_float = Q6_V_vzero();
 
-    static const uint8_t __attribute__((aligned(128))) repl[128] = {
-        0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x40, 0x40, 0x40, 0x40, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-    };
-    HVX_Vector v_repl_ctrl = * (const HVX_Vector *) repl;
-
     const uint32_t quants_size = hex_round_up(n, 128);
     const __fp16 * restrict y_scales = (const __fp16 *) (y_q + quants_size);
 
@@ -438,42 +390,17 @@ static void flat_vec_dot_q4_1_32x1(const uint32_t n, float * restrict s, const v
     for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 640);
 
-        uint32_t block_idx = kt / 4;
-        uint32_t sub_idx = kt % 4;
-
-        HVX_Vector vx_i8 = * (const HVX_Vector *) (y_q + block_idx * 128);
-        HVX_Vector v_act_raw = Q6_V_vror_VR(vx_i8, sub_idx * 32);
-
         HVX_Vector v_act_rep[8];
-        v_act_rep[0] = Q6_V_vdelta_VV(v_act_raw, v_repl_ctrl);
-        v_act_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 4), v_repl_ctrl);
-        v_act_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 8), v_repl_ctrl);
-        v_act_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 12), v_repl_ctrl);
-        v_act_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 16), v_repl_ctrl);
-        v_act_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 20), v_repl_ctrl);
-        v_act_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 24), v_repl_ctrl);
-        v_act_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y_q, kt, v_act_rep);
 
         HVX_Vector v_sum = accum_4bit_32x1(vptr, v_act_rep, Q6_V_vzero());
         HVX_Vector v_sum_sf = Q6_Vsf_equals_Vw(v_sum);
+        HVX_VectorPair p_dm = Q6_W_vdeal_VVR(vptr[4], vptr[4], -2);
 
-        HVX_Vector v_scale_offset = vptr[4];
-        HVX_VectorPair p_deal = Q6_W_vdeal_VVR(v_scale_offset, v_scale_offset, -2);
-        HVX_Vector v_scale = Q6_V_lo_W(p_deal);
-        HVX_Vector v_offset = Q6_V_hi_W(p_deal);
+        HVX_Vector v_scale_a = hvx_vec_repl_f16(Q6_Vh_vsplat_R(*(const int16_t *) &y_scales[kt * 2 + 0]));
+        HVX_Vector v_sum_a   = hvx_vec_repl_f16(Q6_Vh_vsplat_R(*(const int16_t *) &y_scales[kt * 2 + 1]));
 
-        __fp16 scale_a_val = y_scales[kt * 2 + 0];
-        __fp16 sum_a_val   = y_scales[kt * 2 + 1];
-        HVX_Vector v_scale_a = hvx_vec_repl_f16(Q6_Vh_vsplat_R(*(const int16_t *)&scale_a_val));
-        HVX_Vector v_sum_a   = hvx_vec_repl_f16(Q6_Vh_vsplat_R(*(const int16_t *)&sum_a_val));
-
-        HVX_Vector v_scale_comb = hvx_vec_mul_f16_f16_to_f32_lower32(v_scale, v_scale_a);
-        HVX_Vector v_offset_comb = hvx_vec_mul_f16_f16_to_f32_lower32(v_offset, v_sum_a);
-
-        HVX_Vector v_scaled_dot = hvx_vec_mul_f32_f32(v_sum_sf, v_scale_comb);
-        HVX_Vector v_sum_scaled = hvx_vec_add_f32_f32(v_scaled_dot, v_offset_comb);
-
-        v_sum_float = hvx_vec_add_f32_f32(v_sum_float, v_sum_scaled);
+        v_sum_float = hvx_vec_add_f32_f32(v_sum_float, scale_dm_32x1(v_sum_sf, p_dm, v_scale_a, v_sum_a));
     }
 
     if (sz) {
@@ -491,18 +418,6 @@ static void flat_vec_dot_q4_1_32x2(const uint32_t n, float * restrict s0, float 
     HVX_Vector v_sum_float_c0 = Q6_V_vzero();
     HVX_Vector v_sum_float_c1 = Q6_V_vzero();
 
-    static const uint8_t __attribute__((aligned(128))) repl[128] = {
-        0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x40, 0x40, 0x40, 0x40, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-    };
-    HVX_Vector v_repl_ctrl = * (const HVX_Vector *) repl;
-
     const uint32_t quants_size = hex_round_up(n, 128);
     const __fp16 * restrict y0_scales = (const __fp16 *) (y0_q + quants_size);
     const __fp16 * restrict y1_scales = (const __fp16 *) (y1_q + quants_size);
@@ -511,70 +426,23 @@ static void flat_vec_dot_q4_1_32x2(const uint32_t n, float * restrict s0, float 
     for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 640);
 
-        uint32_t block_idx = kt / 4;
-        uint32_t sub_idx = kt % 4;
-
-        HVX_Vector vx0_i8 = * (const HVX_Vector *) (y0_q + block_idx * 128);
-        HVX_Vector vx1_i8 = * (const HVX_Vector *) (y1_q + block_idx * 128);
-
-        HVX_Vector v_act0_raw = Q6_V_vror_VR(vx0_i8, sub_idx * 32);
-        HVX_Vector v_act1_raw = Q6_V_vror_VR(vx1_i8, sub_idx * 32);
-
         HVX_Vector v_act0_rep[8];
-        v_act0_rep[0] = Q6_V_vdelta_VV(v_act0_raw, v_repl_ctrl);
-        v_act0_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 4), v_repl_ctrl);
-        v_act0_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 8), v_repl_ctrl);
-        v_act0_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 12), v_repl_ctrl);
-        v_act0_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 16), v_repl_ctrl);
-        v_act0_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 20), v_repl_ctrl);
-        v_act0_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 24), v_repl_ctrl);
-        v_act0_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 28), v_repl_ctrl);
-
         HVX_Vector v_act1_rep[8];
-        v_act1_rep[0] = Q6_V_vdelta_VV(v_act1_raw, v_repl_ctrl);
-        v_act1_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 4), v_repl_ctrl);
-        v_act1_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 8), v_repl_ctrl);
-        v_act1_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 12), v_repl_ctrl);
-        v_act1_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 16), v_repl_ctrl);
-        v_act1_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 20), v_repl_ctrl);
-        v_act1_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 24), v_repl_ctrl);
-        v_act1_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y0_q, kt, v_act0_rep);
+        flat_replicate_act_32(y1_q, kt, v_act1_rep);
 
         HVX_VectorPair v_sums = accum_4bit_32x2(vptr, v_act0_rep, v_act1_rep, Q6_V_vzero());
-        HVX_Vector v_sum_c0 = Q6_V_lo_W(v_sums);
-        HVX_Vector v_sum_c1 = Q6_V_hi_W(v_sums);
+        HVX_Vector v_sum_sf_c0 = Q6_Vsf_equals_Vw(Q6_V_lo_W(v_sums));
+        HVX_Vector v_sum_sf_c1 = Q6_Vsf_equals_Vw(Q6_V_hi_W(v_sums));
+        HVX_VectorPair p_dm = Q6_W_vdeal_VVR(vptr[4], vptr[4], -2);
 
-        HVX_Vector v_sum_sf_c0 = Q6_Vsf_equals_Vw(v_sum_c0);
-        HVX_Vector v_sum_sf_c1 = Q6_Vsf_equals_Vw(v_sum_c1);
+        HVX_Vector v_scale_a0 = hvx_vec_repl_f16(Q6_Vh_vsplat_R(*(const int16_t *) &y0_scales[kt * 2 + 0]));
+        HVX_Vector v_sum_a0   = hvx_vec_repl_f16(Q6_Vh_vsplat_R(*(const int16_t *) &y0_scales[kt * 2 + 1]));
+        HVX_Vector v_scale_a1 = hvx_vec_repl_f16(Q6_Vh_vsplat_R(*(const int16_t *) &y1_scales[kt * 2 + 0]));
+        HVX_Vector v_sum_a1   = hvx_vec_repl_f16(Q6_Vh_vsplat_R(*(const int16_t *) &y1_scales[kt * 2 + 1]));
 
-        HVX_Vector v_scale_offset = vptr[4];
-        HVX_VectorPair p_deal = Q6_W_vdeal_VVR(v_scale_offset, v_scale_offset, -2);
-        HVX_Vector v_scale = Q6_V_lo_W(p_deal);
-        HVX_Vector v_offset = Q6_V_hi_W(p_deal);
-
-        __fp16 scale_a0_val = y0_scales[kt * 2 + 0];
-        __fp16 sum_a0_val   = y0_scales[kt * 2 + 1];
-        __fp16 scale_a1_val = y1_scales[kt * 2 + 0];
-        __fp16 sum_a1_val   = y1_scales[kt * 2 + 1];
-
-        HVX_Vector v_scale_a0 = hvx_vec_repl_f16(Q6_Vh_vsplat_R(*(const int16_t *)&scale_a0_val));
-        HVX_Vector v_sum_a0   = hvx_vec_repl_f16(Q6_Vh_vsplat_R(*(const int16_t *)&sum_a0_val));
-        HVX_Vector v_scale_a1 = hvx_vec_repl_f16(Q6_Vh_vsplat_R(*(const int16_t *)&scale_a1_val));
-        HVX_Vector v_sum_a1   = hvx_vec_repl_f16(Q6_Vh_vsplat_R(*(const int16_t *)&sum_a1_val));
-
-        HVX_Vector v_scale_comb_c0 = hvx_vec_mul_f16_f16_to_f32_lower32(v_scale, v_scale_a0);
-        HVX_Vector v_offset_comb_c0 = hvx_vec_mul_f16_f16_to_f32_lower32(v_offset, v_sum_a0);
-        HVX_Vector v_scale_comb_c1 = hvx_vec_mul_f16_f16_to_f32_lower32(v_scale, v_scale_a1);
-        HVX_Vector v_offset_comb_c1 = hvx_vec_mul_f16_f16_to_f32_lower32(v_offset, v_sum_a1);
-
-        HVX_Vector v_scaled_dot_c0 = hvx_vec_mul_f32_f32(v_sum_sf_c0, v_scale_comb_c0);
-        HVX_Vector v_sum_scaled_c0 = hvx_vec_add_f32_f32(v_scaled_dot_c0, v_offset_comb_c0);
-
-        HVX_Vector v_scaled_dot_c1 = hvx_vec_mul_f32_f32(v_sum_sf_c1, v_scale_comb_c1);
-        HVX_Vector v_sum_scaled_c1 = hvx_vec_add_f32_f32(v_scaled_dot_c1, v_offset_comb_c1);
-
-        v_sum_float_c0 = hvx_vec_add_f32_f32(v_sum_float_c0, v_sum_scaled_c0);
-        v_sum_float_c1 = hvx_vec_add_f32_f32(v_sum_float_c1, v_sum_scaled_c1);
+        v_sum_float_c0 = hvx_vec_add_f32_f32(v_sum_float_c0, scale_dm_32x1(v_sum_sf_c0, p_dm, v_scale_a0, v_sum_a0));
+        v_sum_float_c1 = hvx_vec_add_f32_f32(v_sum_float_c1, scale_dm_32x1(v_sum_sf_c1, p_dm, v_scale_a1, v_sum_a1));
     }
 
     if (sz0) {
@@ -595,18 +463,6 @@ static void flat_vec_dot_q8_0_32x1(const uint32_t n, float * restrict s, const v
 
     HVX_Vector v_sum_float = Q6_V_vzero();
 
-    static const uint8_t __attribute__((aligned(128))) repl[128] = {
-        0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x40, 0x40, 0x40, 0x40, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-    };
-    HVX_Vector v_repl_ctrl = * (const HVX_Vector *) repl;
-
     const uint32_t quants_size = hex_round_up(n, 128);
     const __fp16 * restrict y_scales = (const __fp16 *) (y_q + quants_size);
 
@@ -614,21 +470,8 @@ static void flat_vec_dot_q8_0_32x1(const uint32_t n, float * restrict s, const v
     for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 1152);
 
-        uint32_t block_idx = kt / 4;
-        uint32_t sub_idx = kt % 4;
-
-        HVX_Vector vx_i8 = * (const HVX_Vector *) (y_q + block_idx * 128);
-        HVX_Vector v_act_raw = Q6_V_vror_VR(vx_i8, sub_idx * 32);
-
         HVX_Vector v_act_rep[8];
-        v_act_rep[0] = Q6_V_vdelta_VV(v_act_raw, v_repl_ctrl);
-        v_act_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 4), v_repl_ctrl);
-        v_act_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 8), v_repl_ctrl);
-        v_act_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 12), v_repl_ctrl);
-        v_act_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 16), v_repl_ctrl);
-        v_act_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 20), v_repl_ctrl);
-        v_act_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 24), v_repl_ctrl);
-        v_act_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y_q, kt, v_act_rep);
 
         HVX_Vector v_sum = accum_q8_0_32x1(vptr, v_act_rep);
         HVX_Vector v_sum_sf = Q6_Vsf_equals_Vw(v_sum);
@@ -659,18 +502,6 @@ static void flat_vec_dot_q8_0_32x2(const uint32_t n, float * restrict s0, float 
     HVX_Vector v_sum_float_c0 = Q6_V_vzero();
     HVX_Vector v_sum_float_c1 = Q6_V_vzero();
 
-    static const uint8_t __attribute__((aligned(128))) repl[128] = {
-        0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x40, 0x40, 0x40, 0x40, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-    };
-    HVX_Vector v_repl_ctrl = * (const HVX_Vector *) repl;
-
     const uint32_t quants_size = hex_round_up(n, 128);
     const __fp16 * restrict y0_scales = (const __fp16 *) (y0_q + quants_size);
     const __fp16 * restrict y1_scales = (const __fp16 *) (y1_q + quants_size);
@@ -679,34 +510,11 @@ static void flat_vec_dot_q8_0_32x2(const uint32_t n, float * restrict s0, float 
     for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 1152);
 
-        uint32_t block_idx = kt / 4;
-        uint32_t sub_idx = kt % 4;
-
-        HVX_Vector vx0_i8 = * (const HVX_Vector *) (y0_q + block_idx * 128);
-        HVX_Vector vx1_i8 = * (const HVX_Vector *) (y1_q + block_idx * 128);
-
-        HVX_Vector v_act0_raw = Q6_V_vror_VR(vx0_i8, sub_idx * 32);
-        HVX_Vector v_act1_raw = Q6_V_vror_VR(vx1_i8, sub_idx * 32);
-
         HVX_Vector v_act0_rep[8];
-        v_act0_rep[0] = Q6_V_vdelta_VV(v_act0_raw, v_repl_ctrl);
-        v_act0_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 4), v_repl_ctrl);
-        v_act0_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 8), v_repl_ctrl);
-        v_act0_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 12), v_repl_ctrl);
-        v_act0_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 16), v_repl_ctrl);
-        v_act0_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 20), v_repl_ctrl);
-        v_act0_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 24), v_repl_ctrl);
-        v_act0_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y0_q, kt, v_act0_rep);
 
         HVX_Vector v_act1_rep[8];
-        v_act1_rep[0] = Q6_V_vdelta_VV(v_act1_raw, v_repl_ctrl);
-        v_act1_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 4), v_repl_ctrl);
-        v_act1_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 8), v_repl_ctrl);
-        v_act1_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 12), v_repl_ctrl);
-        v_act1_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 16), v_repl_ctrl);
-        v_act1_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 20), v_repl_ctrl);
-        v_act1_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 24), v_repl_ctrl);
-        v_act1_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y1_q, kt, v_act1_rep);
 
         HVX_VectorPair v_sums = accum_q8_0_32x2(vptr, v_act0_rep, v_act1_rep);
         HVX_Vector v_sum_c0 = Q6_V_lo_W(v_sums);
@@ -751,18 +559,6 @@ static void flat_vec_dot_q6_k_32x1(const uint32_t n, float * restrict s, const v
     HVX_Vector v_sum_float = Q6_V_vzero();
     HVX_Vector i32 = Q6_Vb_vsplat_R(32);
 
-    static const uint8_t __attribute__((aligned(128))) repl[128] = {
-        0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x40, 0x40, 0x40, 0x40, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-    };
-    HVX_Vector v_repl_ctrl = * (const HVX_Vector *) repl;
-
     const uint32_t quants_size = hex_round_up(n, 128);
     const __fp16 * restrict y_scales = (const __fp16 *) (y_q + quants_size);
 
@@ -770,21 +566,8 @@ static void flat_vec_dot_q6_k_32x1(const uint32_t n, float * restrict s, const v
     for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 896);
 
-        uint32_t block_idx = kt / 4;
-        uint32_t sub_idx = kt % 4;
-
-        HVX_Vector vx_i8 = * (const HVX_Vector *) (y_q + block_idx * 128);
-        HVX_Vector v_act_raw = Q6_V_vror_VR(vx_i8, sub_idx * 32);
-
         HVX_Vector v_act_rep[8];
-        v_act_rep[0] = Q6_V_vdelta_VV(v_act_raw, v_repl_ctrl);
-        v_act_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 4), v_repl_ctrl);
-        v_act_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 8), v_repl_ctrl);
-        v_act_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 12), v_repl_ctrl);
-        v_act_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 16), v_repl_ctrl);
-        v_act_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 20), v_repl_ctrl);
-        v_act_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 24), v_repl_ctrl);
-        v_act_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y_q, kt, v_act_rep);
 
         HVX_VectorPair v_sums = accum_q6_k_32x1(vptr, v_act_rep, i32);
 
@@ -810,18 +593,6 @@ static void flat_vec_dot_q6_k_32x2(const uint32_t n, float * restrict s0, float 
     HVX_Vector v_sum_float_c1 = Q6_V_vzero();
     HVX_Vector i32 = Q6_Vb_vsplat_R(32);
 
-    static const uint8_t __attribute__((aligned(128))) repl[128] = {
-        0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x40, 0x40, 0x40, 0x40, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-    };
-    HVX_Vector v_repl_ctrl = * (const HVX_Vector *) repl;
-
     const uint32_t quants_size = hex_round_up(n, 128);
     const __fp16 * restrict y0_scales = (const __fp16 *) (y0_q + quants_size);
     const __fp16 * restrict y1_scales = (const __fp16 *) (y1_q + quants_size);
@@ -830,32 +601,10 @@ static void flat_vec_dot_q6_k_32x2(const uint32_t n, float * restrict s0, float 
     for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 896);
 
-        uint32_t block_idx = kt / 4;
-        uint32_t sub_idx = kt % 4;
-
-        HVX_Vector vx0_i8 = * (const HVX_Vector *) (y0_q + block_idx * 128);
-        HVX_Vector vx1_i8 = * (const HVX_Vector *) (y1_q + block_idx * 128);
-        HVX_Vector v_act0_raw = Q6_V_vror_VR(vx0_i8, sub_idx * 32);
-        HVX_Vector v_act1_raw = Q6_V_vror_VR(vx1_i8, sub_idx * 32);
-
         HVX_Vector v_act0_rep[8];
+        flat_replicate_act_32(y0_q, kt, v_act0_rep);
         HVX_Vector v_act1_rep[8];
-        v_act0_rep[0] = Q6_V_vdelta_VV(v_act0_raw, v_repl_ctrl);
-        v_act0_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 4), v_repl_ctrl);
-        v_act0_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 8), v_repl_ctrl);
-        v_act0_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 12), v_repl_ctrl);
-        v_act0_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 16), v_repl_ctrl);
-        v_act0_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 20), v_repl_ctrl);
-        v_act0_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 24), v_repl_ctrl);
-        v_act0_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 28), v_repl_ctrl);
-        v_act1_rep[0] = Q6_V_vdelta_VV(v_act1_raw, v_repl_ctrl);
-        v_act1_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 4), v_repl_ctrl);
-        v_act1_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 8), v_repl_ctrl);
-        v_act1_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 12), v_repl_ctrl);
-        v_act1_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 16), v_repl_ctrl);
-        v_act1_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 20), v_repl_ctrl);
-        v_act1_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 24), v_repl_ctrl);
-        v_act1_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y1_q, kt, v_act1_rep);
 
         HVX_VectorPair v_sums0, v_sums1;
         accum_q6_k_32x2(vptr, v_act0_rep, v_act1_rep, i32, &v_sums0, &v_sums1);
@@ -887,18 +636,6 @@ static void flat_vec_dot_q5_k_32x1(const uint32_t n, float * restrict s, const v
 
     HVX_Vector v_sum_float = Q6_V_vzero();
 
-    static const uint8_t __attribute__((aligned(128))) repl[128] = {
-        0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x40, 0x40, 0x40, 0x40, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-    };
-    HVX_Vector v_repl_ctrl = * (const HVX_Vector *) repl;
-
     const uint32_t quants_size = hex_round_up(n, 128);
     const __fp16 * restrict y_scales = (const __fp16 *) (y_q + quants_size);
 
@@ -906,42 +643,17 @@ static void flat_vec_dot_q5_k_32x1(const uint32_t n, float * restrict s, const v
     for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 768);
 
-        uint32_t block_idx = kt / 4;
-        uint32_t sub_idx = kt % 4;
-
-        HVX_Vector vx_i8 = * (const HVX_Vector *) (y_q + block_idx * 128);
-        HVX_Vector v_act_raw = Q6_V_vror_VR(vx_i8, sub_idx * 32);
-
         HVX_Vector v_act_rep[8];
-        v_act_rep[0] = Q6_V_vdelta_VV(v_act_raw, v_repl_ctrl);
-        v_act_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 4), v_repl_ctrl);
-        v_act_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 8), v_repl_ctrl);
-        v_act_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 12), v_repl_ctrl);
-        v_act_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 16), v_repl_ctrl);
-        v_act_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 20), v_repl_ctrl);
-        v_act_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 24), v_repl_ctrl);
-        v_act_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y_q, kt, v_act_rep);
 
         HVX_Vector v_sum = accum_q5_k_32x1(vptr, v_act_rep);
         HVX_Vector v_sum_sf = Q6_Vsf_equals_Vw(v_sum);
+        HVX_VectorPair p_dm = Q6_W_vdeal_VVR(vptr[5], vptr[5], -2);
 
-        HVX_Vector v_scale_offset = vptr[5];
-        HVX_VectorPair p_deal = Q6_W_vdeal_VVR(v_scale_offset, v_scale_offset, -2);
-        HVX_Vector v_scale = Q6_V_lo_W(p_deal);
-        HVX_Vector v_offset = Q6_V_hi_W(p_deal);
+        HVX_Vector v_scale_a = hvx_vec_repl_f16(Q6_Vh_vsplat_R(*(const int16_t *) &y_scales[kt * 2 + 0]));
+        HVX_Vector v_sum_a   = hvx_vec_repl_f16(Q6_Vh_vsplat_R(*(const int16_t *) &y_scales[kt * 2 + 1]));
 
-        __fp16 scale_a_val = y_scales[kt * 2 + 0];
-        __fp16 sum_a_val   = y_scales[kt * 2 + 1];
-        HVX_Vector v_scale_a = hvx_vec_repl_f16(Q6_Vh_vsplat_R(*(const int16_t *)&scale_a_val));
-        HVX_Vector v_sum_a   = hvx_vec_repl_f16(Q6_Vh_vsplat_R(*(const int16_t *)&sum_a_val));
-
-        HVX_Vector v_scale_comb = hvx_vec_mul_f16_f16_to_f32_lower32(v_scale, v_scale_a);
-        HVX_Vector v_offset_comb = hvx_vec_mul_f16_f16_to_f32_lower32(v_offset, v_sum_a);
-
-        HVX_Vector v_scaled_dot = hvx_vec_mul_f32_f32(v_sum_sf, v_scale_comb);
-        HVX_Vector v_sum_scaled = hvx_vec_add_f32_f32(v_scaled_dot, v_offset_comb);
-
-        v_sum_float = hvx_vec_add_f32_f32(v_sum_float, v_sum_scaled);
+        v_sum_float = hvx_vec_add_f32_f32(v_sum_float, scale_dm_32x1(v_sum_sf, p_dm, v_scale_a, v_sum_a));
     }
 
     if (sz) {
@@ -959,18 +671,6 @@ static void flat_vec_dot_q5_k_32x2(const uint32_t n, float * restrict s0, float 
     HVX_Vector v_sum_float_c0 = Q6_V_vzero();
     HVX_Vector v_sum_float_c1 = Q6_V_vzero();
 
-    static const uint8_t __attribute__((aligned(128))) repl[128] = {
-        0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x40, 0x40, 0x40, 0x40, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-    };
-    HVX_Vector v_repl_ctrl = * (const HVX_Vector *) repl;
-
     const uint32_t quants_size = hex_round_up(n, 128);
     const __fp16 * restrict y0_scales = (const __fp16 *) (y0_q + quants_size);
     const __fp16 * restrict y1_scales = (const __fp16 *) (y1_q + quants_size);
@@ -979,34 +679,11 @@ static void flat_vec_dot_q5_k_32x2(const uint32_t n, float * restrict s0, float 
     for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 768);
 
-        uint32_t block_idx = kt / 4;
-        uint32_t sub_idx = kt % 4;
-
-        HVX_Vector vx0_i8 = * (const HVX_Vector *) (y0_q + block_idx * 128);
-        HVX_Vector vx1_i8 = * (const HVX_Vector *) (y1_q + block_idx * 128);
-
-        HVX_Vector v_act0_raw = Q6_V_vror_VR(vx0_i8, sub_idx * 32);
-        HVX_Vector v_act1_raw = Q6_V_vror_VR(vx1_i8, sub_idx * 32);
-
         HVX_Vector v_act0_rep[8];
-        v_act0_rep[0] = Q6_V_vdelta_VV(v_act0_raw, v_repl_ctrl);
-        v_act0_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 4), v_repl_ctrl);
-        v_act0_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 8), v_repl_ctrl);
-        v_act0_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 12), v_repl_ctrl);
-        v_act0_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 16), v_repl_ctrl);
-        v_act0_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 20), v_repl_ctrl);
-        v_act0_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 24), v_repl_ctrl);
-        v_act0_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y0_q, kt, v_act0_rep);
 
         HVX_Vector v_act1_rep[8];
-        v_act1_rep[0] = Q6_V_vdelta_VV(v_act1_raw, v_repl_ctrl);
-        v_act1_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 4), v_repl_ctrl);
-        v_act1_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 8), v_repl_ctrl);
-        v_act1_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 12), v_repl_ctrl);
-        v_act1_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 16), v_repl_ctrl);
-        v_act1_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 20), v_repl_ctrl);
-        v_act1_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 24), v_repl_ctrl);
-        v_act1_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y1_q, kt, v_act1_rep);
 
         HVX_VectorPair v_sums = accum_q5_k_32x2(vptr, v_act0_rep, v_act1_rep);
         HVX_Vector v_sum_c0 = Q6_V_lo_W(v_sums);
@@ -1065,18 +742,6 @@ static void flat_vec_dot_iq4nl_32x1(const uint32_t n, float * restrict s, const 
     HVX_Vector mask_h4 = Q6_Vb_vsplat_R(0x0F);
     HVX_Vector lut = *(const HVX_Vector *) kvalues_iq4nl_lut;
 
-    static const uint8_t __attribute__((aligned(128))) repl[128] = {
-        0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x40, 0x40, 0x40, 0x40, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-    };
-    HVX_Vector v_repl_ctrl = * (const HVX_Vector *) repl;
-
     const uint32_t quants_size = hex_round_up(n, 128);
     const __fp16 * restrict y_scales = (const __fp16 *) (y_q + quants_size);
 
@@ -1084,21 +749,8 @@ static void flat_vec_dot_iq4nl_32x1(const uint32_t n, float * restrict s, const 
     for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 640);
 
-        uint32_t block_idx = kt / 4;
-        uint32_t sub_idx = kt % 4;
-
-        HVX_Vector vx = * (const HVX_Vector *) (y_q + block_idx * 128);
-        HVX_Vector v_act_raw = Q6_V_vror_VR(vx, sub_idx * 32);
-
         HVX_Vector v_act_rep[8];
-        v_act_rep[0] = Q6_V_vdelta_VV(v_act_raw, v_repl_ctrl);
-        v_act_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 4), v_repl_ctrl);
-        v_act_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 8), v_repl_ctrl);
-        v_act_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 12), v_repl_ctrl);
-        v_act_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 16), v_repl_ctrl);
-        v_act_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 20), v_repl_ctrl);
-        v_act_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 24), v_repl_ctrl);
-        v_act_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y_q, kt, v_act_rep);
 
         HVX_Vector v_sum = accum_4bit_32x1_lut(vptr, v_act_rep, mask_h4, lut);
         HVX_Vector v_sum_sf = Q6_Vsf_equals_Vw(v_sum);
@@ -1131,18 +783,6 @@ static void flat_vec_dot_iq4nl_32x2(const uint32_t n, float * restrict s0, float
     HVX_Vector mask_h4        = Q6_Vb_vsplat_R(0x0F);
     HVX_Vector lut            = *(const HVX_Vector *) kvalues_iq4nl_lut;
 
-    static const uint8_t __attribute__((aligned(128))) repl[128] = {
-        0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x40, 0x40, 0x40, 0x40, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-    };
-    HVX_Vector v_repl_ctrl = * (const HVX_Vector *) repl;
-
     const uint32_t quants_size = hex_round_up(n, 128);
     const __fp16 * restrict y0_scales = (const __fp16 *) (y0_q + quants_size);
     const __fp16 * restrict y1_scales = (const __fp16 *) (y1_q + quants_size);
@@ -1151,34 +791,11 @@ static void flat_vec_dot_iq4nl_32x2(const uint32_t n, float * restrict s0, float
     for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 640);
 
-        uint32_t block_idx = kt / 4;
-        uint32_t sub_idx = kt % 4;
-
-        HVX_Vector vx0 = * (const HVX_Vector *) (y0_q + block_idx * 128);
-        HVX_Vector vx1 = * (const HVX_Vector *) (y1_q + block_idx * 128);
-
-        HVX_Vector v_act0_raw = Q6_V_vror_VR(vx0, sub_idx * 32);
-        HVX_Vector v_act1_raw = Q6_V_vror_VR(vx1, sub_idx * 32);
-
         HVX_Vector v_act0_rep[8];
-        v_act0_rep[0] = Q6_V_vdelta_VV(v_act0_raw, v_repl_ctrl);
-        v_act0_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 4), v_repl_ctrl);
-        v_act0_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 8), v_repl_ctrl);
-        v_act0_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 12), v_repl_ctrl);
-        v_act0_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 16), v_repl_ctrl);
-        v_act0_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 20), v_repl_ctrl);
-        v_act0_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 24), v_repl_ctrl);
-        v_act0_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y0_q, kt, v_act0_rep);
 
         HVX_Vector v_act1_rep[8];
-        v_act1_rep[0] = Q6_V_vdelta_VV(v_act1_raw, v_repl_ctrl);
-        v_act1_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 4), v_repl_ctrl);
-        v_act1_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 8), v_repl_ctrl);
-        v_act1_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 12), v_repl_ctrl);
-        v_act1_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 16), v_repl_ctrl);
-        v_act1_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 20), v_repl_ctrl);
-        v_act1_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 24), v_repl_ctrl);
-        v_act1_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y1_q, kt, v_act1_rep);
 
         HVX_VectorPair v_sums = accum_4bit_32x2_lut(vptr, v_act0_rep, v_act1_rep, mask_h4, lut);
         HVX_Vector v_sum_c0 = Q6_V_lo_W(v_sums);
@@ -1226,18 +843,6 @@ static void flat_vec_dot_mxfp4_32x1(const uint32_t n, float * restrict s, const 
     HVX_Vector expand = *(const HVX_Vector *) expand_x32_e8m0;
     HVX_Vector e8m0_mask = Q6_V_vsplat_R(0x000000ff);
 
-    static const uint8_t __attribute__((aligned(128))) repl[128] = {
-        0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x40, 0x40, 0x40, 0x40, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-    };
-    HVX_Vector v_repl_ctrl = * (const HVX_Vector *) repl;
-
     const uint32_t quants_size = hex_round_up(n, 128);
     const __fp16 * restrict y_scales = (const __fp16 *) (y_q + quants_size);
 
@@ -1245,21 +850,8 @@ static void flat_vec_dot_mxfp4_32x1(const uint32_t n, float * restrict s, const 
     for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 640);
 
-        uint32_t block_idx = kt / 4;
-        uint32_t sub_idx = kt % 4;
-
-        HVX_Vector vx = * (const HVX_Vector *) (y_q + block_idx * 128);
-        HVX_Vector v_act_raw = Q6_V_vror_VR(vx, sub_idx * 32);
-
         HVX_Vector v_act_rep[8];
-        v_act_rep[0] = Q6_V_vdelta_VV(v_act_raw, v_repl_ctrl);
-        v_act_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 4), v_repl_ctrl);
-        v_act_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 8), v_repl_ctrl);
-        v_act_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 12), v_repl_ctrl);
-        v_act_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 16), v_repl_ctrl);
-        v_act_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 20), v_repl_ctrl);
-        v_act_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 24), v_repl_ctrl);
-        v_act_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y_q, kt, v_act_rep);
 
         HVX_Vector v_sum = accum_4bit_32x1_lut(vptr, v_act_rep, mask_h4, lut);
         HVX_Vector v_sum_sf = Q6_Vsf_equals_Vw(v_sum);
@@ -1301,18 +893,6 @@ static void flat_vec_dot_mxfp4_32x2(const uint32_t n, float * restrict s0, float
     HVX_Vector expand = *(const HVX_Vector *) expand_x32_e8m0;
     HVX_Vector e8m0_mask = Q6_V_vsplat_R(0x000000ff);
 
-    static const uint8_t __attribute__((aligned(128))) repl[128] = {
-        0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x40, 0x40, 0x40, 0x40, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x20, 0x20, 0x20, 0x20, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-        0x10, 0x10, 0x10, 0x10, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
-    };
-    HVX_Vector v_repl_ctrl = * (const HVX_Vector *) repl;
-
     const uint32_t quants_size = hex_round_up(n, 128);
     const __fp16 * restrict y0_scales = (const __fp16 *) (y0_q + quants_size);
     const __fp16 * restrict y1_scales = (const __fp16 *) (y1_q + quants_size);
@@ -1321,34 +901,11 @@ static void flat_vec_dot_mxfp4_32x2(const uint32_t n, float * restrict s0, float
     for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 640);
 
-        uint32_t block_idx = kt / 4;
-        uint32_t sub_idx = kt % 4;
-
-        HVX_Vector vx0 = * (const HVX_Vector *) (y0_q + block_idx * 128);
-        HVX_Vector vx1 = * (const HVX_Vector *) (y1_q + block_idx * 128);
-
-        HVX_Vector v_act0_raw = Q6_V_vror_VR(vx0, sub_idx * 32);
-        HVX_Vector v_act1_raw = Q6_V_vror_VR(vx1, sub_idx * 32);
-
         HVX_Vector v_act0_rep[8];
-        v_act0_rep[0] = Q6_V_vdelta_VV(v_act0_raw, v_repl_ctrl);
-        v_act0_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 4), v_repl_ctrl);
-        v_act0_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 8), v_repl_ctrl);
-        v_act0_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 12), v_repl_ctrl);
-        v_act0_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 16), v_repl_ctrl);
-        v_act0_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 20), v_repl_ctrl);
-        v_act0_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 24), v_repl_ctrl);
-        v_act0_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act0_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y0_q, kt, v_act0_rep);
 
         HVX_Vector v_act1_rep[8];
-        v_act1_rep[0] = Q6_V_vdelta_VV(v_act1_raw, v_repl_ctrl);
-        v_act1_rep[1] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 4), v_repl_ctrl);
-        v_act1_rep[2] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 8), v_repl_ctrl);
-        v_act1_rep[3] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 12), v_repl_ctrl);
-        v_act1_rep[4] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 16), v_repl_ctrl);
-        v_act1_rep[5] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 20), v_repl_ctrl);
-        v_act1_rep[6] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 24), v_repl_ctrl);
-        v_act1_rep[7] = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act1_raw, 28), v_repl_ctrl);
+        flat_replicate_act_32(y1_q, kt, v_act1_rep);
 
         HVX_VectorPair v_sums = accum_4bit_32x2_lut(vptr, v_act0_rep, v_act1_rep, mask_h4, lut);
         HVX_Vector v_sum_c0 = Q6_V_lo_W(v_sums);

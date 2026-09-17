@@ -201,6 +201,29 @@ next_nc:
     return 0;
 }
 
+// --- Weight Type Helpers ---
+// types with a repacked tiled weight layout, see the HTP_MM_WEIGHT_TILE_SIZE_* definitions above
+static inline bool htp_mm_is_repack_type(int weight_type) {
+    switch (weight_type) {
+        case HTP_TYPE_Q4_0:
+        case HTP_TYPE_Q4_1:
+        case HTP_TYPE_Q8_0:
+        case HTP_TYPE_IQ4_NL:
+        case HTP_TYPE_MXFP4:
+        case HTP_TYPE_Q4_K:
+        case HTP_TYPE_Q5_K:
+        case HTP_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// types with a per-row min (affine dequant) need Q8_1 activations: the scale and the scaled sum of the activations
+static inline bool htp_mm_weight_has_min(int weight_type) {
+    return weight_type == HTP_TYPE_Q4_1 || weight_type == HTP_TYPE_Q4_K || weight_type == HTP_TYPE_Q5_K;
+}
+
 // --- Tile Size Helpers ---
 static inline uint32_t htp_mm_get_weight_tile_size(int weight_type) {
     switch (weight_type) {
@@ -273,16 +296,10 @@ static inline size_t htp_mm_q8_1_flat_row_size(uint32_t ne) {
 
 static inline size_t htp_mm_get_tiled_row_stride(int weight_type, uint32_t k) {
     uint32_t nb = (k + QK_Q4_0_TILED - 1) / QK_Q4_0_TILED;
+    if (htp_mm_is_repack_type(weight_type)) {
+        return (size_t) nb * htp_mm_get_weight_tile_size(weight_type);
+    }
     switch (weight_type) {
-        case HTP_TYPE_Q4_0:
-        case HTP_TYPE_IQ4_NL:
-        case HTP_TYPE_Q4_1:
-        case HTP_TYPE_Q4_K:
-        case HTP_TYPE_Q8_0:
-        case HTP_TYPE_Q5_K:
-        case HTP_TYPE_Q6_K:
-        case HTP_TYPE_MXFP4:
-            return (size_t) nb * htp_mm_get_weight_tile_size(weight_type);
         case HTP_TYPE_F16:
             return (size_t) k * sizeof(__fp16);
         case HTP_TYPE_F32:
@@ -508,10 +525,7 @@ static inline void htp_mm_hvx_vtcm_layout_build(
     size_t src3_sz = 0;
     size_t dst_sz  = 0;
 
-    const bool is_repack = (wtype == HTP_TYPE_Q4_0 || wtype == HTP_TYPE_Q4_1 ||
-                            wtype == HTP_TYPE_Q8_0 || wtype == HTP_TYPE_IQ4_NL ||
-                            wtype == HTP_TYPE_MXFP4 || wtype == HTP_TYPE_Q6_K ||
-                            wtype == HTP_TYPE_Q4_K || wtype == HTP_TYPE_Q5_K);
+    const bool is_repack = htp_mm_is_repack_type(wtype);
 
     if (is_fused_nx) {
         const size_t src0_row_size_padded = hex_round_up(src0_row_size, 128);
@@ -529,8 +543,8 @@ static inline void htp_mm_hvx_vtcm_layout_build(
             weight_sz_per_thread = hex_round_up(n_prefetch * src0_row_size_padded, 128);
         }
 
-        size_t flat_act_row_size  = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K || wtype == HTP_TYPE_Q5_K) ? htp_mm_q8_1_flat_row_size(ne10)  : htp_mm_q8_0_flat_row_size(ne10);
-        size_t tiled_act_row_size = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K || wtype == HTP_TYPE_Q5_K) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
+        size_t flat_act_row_size  = htp_mm_weight_has_min(wtype) ? htp_mm_q8_1_flat_row_size(ne10)  : htp_mm_q8_0_flat_row_size(ne10);
+        size_t tiled_act_row_size = htp_mm_weight_has_min(wtype) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
 
         size_t act_sz = (kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT)
             ? hex_round_up(flat_act_row_size  * src1_nrows, 128)
@@ -543,8 +557,7 @@ static inline void htp_mm_hvx_vtcm_layout_build(
         dst_sz  = quant_scratch_size;
     } else if (is_matmul_id) {
         const size_t src0_row_size_padded = htp_mm_round_up(src0_row_size, 128);
-        const size_t src1_row_size_tiled = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K || wtype == HTP_TYPE_Q5_K) ? htp_mm_q8_1_tiled_row_size(ne10)
-                                                                                               : htp_mm_q8_0_tiled_row_size(ne10);
+        const size_t src1_row_size_tiled = htp_mm_weight_has_min(wtype) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
 
         size_t src0_sz_per_thread = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256);
         src1_sz                   = htp_mm_round_up(src1_row_size_tiled * src1_nrows, 256);
@@ -589,7 +602,7 @@ static inline void htp_mm_hvx_vtcm_layout_build(
             }
             case HTP_MM_KERNEL_HVX_QUANT_BLOCK:
             case HTP_MM_KERNEL_HVX_QUANT_ROW: {
-                size_t q_src1_row_size = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K || wtype == HTP_TYPE_Q5_K) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
+                size_t q_src1_row_size = htp_mm_weight_has_min(wtype) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
 
                 src0_sz = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256);
                 src1_sz = htp_mm_round_up(q_src1_row_size * src1_nrows, 256);
@@ -611,7 +624,7 @@ static inline void htp_mm_hvx_vtcm_layout_build(
                 break;
             }
             case HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT: {
-                size_t q_src1_row_size = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K || wtype == HTP_TYPE_Q5_K) ? htp_mm_q8_1_flat_row_size(ne10) : htp_mm_q8_0_flat_row_size(ne10);
+                size_t q_src1_row_size = htp_mm_weight_has_min(wtype) ? htp_mm_q8_1_flat_row_size(ne10) : htp_mm_q8_0_flat_row_size(ne10);
 
                 src0_sz = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256);
                 src1_sz = htp_mm_round_up(q_src1_row_size * src1_nrows, 256);
