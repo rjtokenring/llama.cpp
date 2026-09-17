@@ -330,7 +330,10 @@ struct htp_opformat {
                        type == HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT) {
                 path = "hvx-flat";
             }
-            snprintf(str, max_size, "%s vtcm %d", path, (int) kparams->vtcm_size);
+            // chunk sizes matter: the VTCM budget bounds them, and they set how many passes the
+            // kernel makes over the weights
+            snprintf(str, max_size, "%s vtcm %d mc %d nc %d pipe %d", path, (int) kparams->vtcm_size,
+                     (int) kparams->m_chunk, (int) kparams->n_chunk, (int) kparams->pipeline);
         } else if (node.opcode == HTP_OP_FLASH_ATTN_EXT) {
             const auto * kparams = (const struct htp_fa_kernel_params *) node.kernel_params;
             const char * path = "unknown";
