@@ -1340,6 +1340,9 @@ static void htp_main_thread(void * context) {
 
     FARF(HIGH, "htp-main-thread: started");
 
+    int      last_err = 0; // last unexpected dspqueue_peek result
+    uint32_t n_errors = 0; // consecutive occurrences of last_err
+    uint32_t log_at   = 1; // occurrence count that gets the next log line: 1, 10, 100, ... (no flooding)
     while (!atomic_load(&ctx->killed)) {
         uint32_t flags = 0;
         uint32_t num_buffers = 0;
@@ -1347,12 +1350,27 @@ static void htp_main_thread(void * context) {
 
         int err = dspqueue_peek(ctx->dsp_queue, &flags, &num_buffers, &message_length, 50000);
         if (err == 0) {
+            last_err = 0; n_errors = 0; log_at = 1;
             process_ops(ctx);
-        } else if (err == AEE_EWOULDBLOCK || err == AEE_EEXPIRED) {
+        } else if (err == AEE_EEXPIRED || err == QURT_ETIMEDOUT || err == AEE_EWOULDBLOCK || err == AEE_EINTERRUPTED) {
+            // Nothing to do: a timeout (reported as AEE_EEXPIRED or, occasionally, as the raw QURT_ETIMEDOUT) or a
+            // canceled wait. The loop condition picks up a stop request.
+            last_err = 0; n_errors = 0; log_at = 1;
             continue;
         } else {
-            FARF(ERROR, "dspqueue_peek failed: 0x%08x", (unsigned) err);
-            break;
+            // AEE_EBADITEM / AEE_EBADSTATE or anything undocumented. Never leave the loop: a request may already be
+            // sitting in the queue and the host waits for its response, and a live thread can still be observed.
+            // Fall back to the idle cadence of the loop (the peek timeout). Log the first occurrence of an error,
+            // then only at 10, 100, 1000... consecutive ones, so a persistent error does not flood the log.
+            if (err != last_err) {
+                last_err = err; n_errors = 0; log_at = 1;
+            }
+            n_errors++;
+            if (n_errors == log_at) {
+                FARF(ERROR, "dspqueue_peek failed: 0x%08x (%u consecutive), retrying", (unsigned) err, n_errors);
+                log_at *= 10;
+            }
+            qurt_sleep(50000);
         }
     }
 
