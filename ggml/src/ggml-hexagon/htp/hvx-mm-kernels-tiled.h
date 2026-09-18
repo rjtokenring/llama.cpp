@@ -400,58 +400,72 @@ static inline HVX_Vector unpack_q6_k_group(const HVX_Vector * restrict vptr, int
     return Q6_Vb_vsub_VbVb(v_q, i32);
 }
 
-// k 0..15 and k 16..31 of a Q6_K tile have different scales: lo half of the pair sums k 0..15, hi half sums k 16..31
-static inline HVX_VectorPair accum_q6_k_32x1(
-    const HVX_Vector * restrict vptr,
-    const HVX_Vector * restrict v_act,
-    HVX_Vector i32
-) {
-    HVX_Vector v_sum_lo = Q6_V_vzero();
-    HVX_Vector v_sum_hi = Q6_V_vzero();
-    HVX_Vector mask_0f = Q6_Vb_vsplat_R(0x0F);
-    HVX_Vector mask_03 = Q6_Vb_vsplat_R(0x03);
-
-    #pragma unroll
-    for (int g = 0; g < 4; g++) {
-        HVX_Vector v_W_lo = unpack_q6_k_group(vptr, g,     mask_0f, mask_03, i32);
-        HVX_Vector v_W_hi = unpack_q6_k_group(vptr, g + 4, mask_0f, mask_03, i32);
-        v_sum_lo = Q6_Vw_vrmpyacc_VwVbVb(v_sum_lo, v_W_lo, v_act[g]);
-        v_sum_hi = Q6_Vw_vrmpyacc_VwVbVb(v_sum_hi, v_W_hi, v_act[g + 4]);
-    }
-
-    return Q6_W_vcombine_VV(v_sum_hi, v_sum_lo);
+// Q3_K weights are stored unsigned (0..7), see HTP_MM_WEIGHT_TILE_SIZE_Q3_K. Unpack k-group g of a tile to signed bytes (q - 4)
+static inline HVX_Vector unpack_q3_k_group(const HVX_Vector * restrict vptr, int g, HVX_Vector mask_03, HVX_Vector mask_01, HVX_Vector i4) {
+    HVX_Vector v_lo = (g & 3) ? Q6_Vub_vlsr_VubR(vptr[g >> 2], 2 * (g & 3)) : vptr[g >> 2];
+    HVX_Vector v_hi = g ? Q6_Vub_vlsr_VubR(vptr[2], g) : vptr[2];
+    HVX_Vector v_q  = Q6_V_vor_VV(Q6_V_vand_VV(v_lo, mask_03), Q6_Vw_vasl_VwR(Q6_V_vand_VV(v_hi, mask_01), 2));
+    return Q6_Vb_vsub_VbVb(v_q, i4);
 }
 
-static inline void accum_q6_k_32x2(
-    const HVX_Vector * restrict vptr,
-    const HVX_Vector * restrict v_act0,
-    const HVX_Vector * restrict v_act1,
-    HVX_Vector i32,
-    HVX_VectorPair * v_sums0,
-    HVX_VectorPair * v_sums1
-) {
-    HVX_Vector v_sum0_lo = Q6_V_vzero();
-    HVX_Vector v_sum0_hi = Q6_V_vzero();
-    HVX_Vector v_sum1_lo = Q6_V_vzero();
-    HVX_Vector v_sum1_hi = Q6_V_vzero();
-    HVX_Vector mask_0f = Q6_Vb_vsplat_R(0x0F);
-    HVX_Vector mask_03 = Q6_Vb_vsplat_R(0x03);
-
-    #pragma unroll
-    for (int g = 0; g < 4; g++) {
-        HVX_Vector v_W_lo = unpack_q6_k_group(vptr, g,     mask_0f, mask_03, i32);
-        HVX_Vector v_W_hi = unpack_q6_k_group(vptr, g + 4, mask_0f, mask_03, i32);
-        v_sum0_lo = Q6_Vw_vrmpyacc_VwVbVb(v_sum0_lo, v_W_lo, v_act0[g]);
-        v_sum0_hi = Q6_Vw_vrmpyacc_VwVbVb(v_sum0_hi, v_W_hi, v_act0[g + 4]);
-        v_sum1_lo = Q6_Vw_vrmpyacc_VwVbVb(v_sum1_lo, v_W_lo, v_act1[g]);
-        v_sum1_hi = Q6_Vw_vrmpyacc_VwVbVb(v_sum1_hi, v_W_hi, v_act1[g + 4]);
-    }
-
-    *v_sums0 = Q6_W_vcombine_VV(v_sum0_hi, v_sum0_lo);
-    *v_sums1 = Q6_W_vcombine_VV(v_sum1_hi, v_sum1_lo);
+// Accumulators for the K-quant tiles with two scales per row (Q6_K, Q3_K): k 0..15 and k 16..31 have different scales,
+// so the lo half of the pair sums k 0..15 and the hi half k 16..31. UNPACK(vptr, g, mask_a, mask_b, v_bias) unpacks
+// k-group g to signed bytes; after the unroll g is a constant, so its shifts fold as in the hand-written kernels.
+#define KQ_ACCUM_2SCALE_IMPL(SUFFIX, UNPACK, MASK_A, MASK_B)                                        \
+static inline HVX_VectorPair accum_##SUFFIX##_32x1(                                                 \
+    const HVX_Vector * restrict vptr,                                                               \
+    const HVX_Vector * restrict v_act,                                                               \
+    HVX_Vector v_bias                                                                               \
+) {                                                                                                 \
+    HVX_Vector v_sum_lo = Q6_V_vzero();                                                             \
+    HVX_Vector v_sum_hi = Q6_V_vzero();                                                             \
+    HVX_Vector mask_a = Q6_Vb_vsplat_R(MASK_A);                                                     \
+    HVX_Vector mask_b = Q6_Vb_vsplat_R(MASK_B);                                                     \
+                                                                                                    \
+    _Pragma("unroll")                                                                               \
+    for (int g = 0; g < 4; g++) {                                                                   \
+        HVX_Vector v_W_lo = UNPACK(vptr, g,     mask_a, mask_b, v_bias);                            \
+        HVX_Vector v_W_hi = UNPACK(vptr, g + 4, mask_a, mask_b, v_bias);                            \
+        v_sum_lo = Q6_Vw_vrmpyacc_VwVbVb(v_sum_lo, v_W_lo, v_act[g]);                               \
+        v_sum_hi = Q6_Vw_vrmpyacc_VwVbVb(v_sum_hi, v_W_hi, v_act[g + 4]);                           \
+    }                                                                                               \
+                                                                                                    \
+    return Q6_W_vcombine_VV(v_sum_hi, v_sum_lo);                                                    \
+}                                                                                                   \
+                                                                                                    \
+static inline void accum_##SUFFIX##_32x2(                                                           \
+    const HVX_Vector * restrict vptr,                                                               \
+    const HVX_Vector * restrict v_act0,                                                              \
+    const HVX_Vector * restrict v_act1,                                                              \
+    HVX_Vector v_bias,                                                                              \
+    HVX_VectorPair * v_sums0,                                                                       \
+    HVX_VectorPair * v_sums1                                                                        \
+) {                                                                                                 \
+    HVX_Vector v_sum0_lo = Q6_V_vzero();                                                            \
+    HVX_Vector v_sum0_hi = Q6_V_vzero();                                                            \
+    HVX_Vector v_sum1_lo = Q6_V_vzero();                                                            \
+    HVX_Vector v_sum1_hi = Q6_V_vzero();                                                            \
+    HVX_Vector mask_a = Q6_Vb_vsplat_R(MASK_A);                                                     \
+    HVX_Vector mask_b = Q6_Vb_vsplat_R(MASK_B);                                                     \
+                                                                                                    \
+    _Pragma("unroll")                                                                               \
+    for (int g = 0; g < 4; g++) {                                                                   \
+        HVX_Vector v_W_lo = UNPACK(vptr, g,     mask_a, mask_b, v_bias);                            \
+        HVX_Vector v_W_hi = UNPACK(vptr, g + 4, mask_a, mask_b, v_bias);                            \
+        v_sum0_lo = Q6_Vw_vrmpyacc_VwVbVb(v_sum0_lo, v_W_lo, v_act0[g]);                            \
+        v_sum0_hi = Q6_Vw_vrmpyacc_VwVbVb(v_sum0_hi, v_W_hi, v_act0[g + 4]);                        \
+        v_sum1_lo = Q6_Vw_vrmpyacc_VwVbVb(v_sum1_lo, v_W_lo, v_act1[g]);                            \
+        v_sum1_hi = Q6_Vw_vrmpyacc_VwVbVb(v_sum1_hi, v_W_hi, v_act1[g + 4]);                        \
+    }                                                                                               \
+                                                                                                    \
+    *v_sums0 = Q6_W_vcombine_VV(v_sum0_hi, v_sum0_lo);                                              \
+    *v_sums1 = Q6_W_vcombine_VV(v_sum1_hi, v_sum1_lo);                                              \
 }
 
-// scale the two half sums with the per-row tile scales (v_scale_w = vptr[6]) and the activation scale
+KQ_ACCUM_2SCALE_IMPL(q6_k, unpack_q6_k_group, 0x0F, 0x03)
+KQ_ACCUM_2SCALE_IMPL(q3_k, unpack_q3_k_group, 0x03, 0x01)
+
+// scale the two half sums with the per-row tile scales (v_scale_w = the fp16 scale vector of the tile) and the activation scale
 static inline HVX_Vector scale_q6_k_32x1(HVX_VectorPair v_sums, HVX_Vector v_scale_w, HVX_Vector v_scale_a) {
     HVX_Vector v_scale_lo = hvx_vec_mul_f16_f16_to_f32_lower32(v_scale_w, v_scale_a);
     HVX_Vector v_scale_hi = hvx_vec_mul_f16_f16_to_f32_lower32(Q6_V_vror_VR(v_scale_w, 64), v_scale_a);
@@ -884,6 +898,63 @@ static void tiled_vec_dot_q6_k_32x2(const uint32_t n, float * restrict s0, float
 
         v_sum_float_c0 = hvx_vec_add_f32_f32(v_sum_float_c0, scale_q6_k_32x1(v_sums0, vptr[6], v_act0[8]));
         v_sum_float_c1 = hvx_vec_add_f32_f32(v_sum_float_c1, scale_q6_k_32x1(v_sums1, vptr[6], v_act1[8]));
+    }
+
+    if (sz0) {
+        hvx_vec_store_u(s0, valid_rows * sizeof(float), hvx_vec_add_f32_f32(v_sum_float_c0, hvx_vmemu(sz0)));
+    } else {
+        hvx_vec_store_u(s0, valid_rows * sizeof(float), v_sum_float_c0);
+    }
+    if (sz1) {
+        hvx_vec_store_u(s1, valid_rows * sizeof(float), hvx_vec_add_f32_f32(v_sum_float_c1, hvx_vmemu(sz1)));
+    } else {
+        hvx_vec_store_u(s1, valid_rows * sizeof(float), v_sum_float_c1);
+    }
+}
+
+static void tiled_vec_dot_q3_k_32x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy, uint32_t valid_rows, const float * restrict sz) {
+    const uint8_t * restrict tile_ptr = vx;
+    const uint8_t * restrict y_q = vy;
+
+    HVX_Vector v_sum_float = Q6_V_vzero();
+    HVX_Vector i4 = Q6_Vb_vsplat_R(4);
+
+    uint32_t n_k_tiles = n / 32;
+    for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
+        const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 512);
+        const HVX_Vector * restrict v_act = (const HVX_Vector *) (y_q + kt * 1152);
+
+        HVX_VectorPair v_sums = accum_q3_k_32x1(vptr, v_act, i4);
+        v_sum_float = hvx_vec_add_f32_f32(v_sum_float, scale_q6_k_32x1(v_sums, vptr[3], v_act[8]));
+    }
+
+    if (sz) {
+        hvx_vec_store_u(s, valid_rows * sizeof(float), hvx_vec_add_f32_f32(v_sum_float, hvx_vmemu(sz)));
+    } else {
+        hvx_vec_store_u(s, valid_rows * sizeof(float), v_sum_float);
+    }
+}
+
+static void tiled_vec_dot_q3_k_32x2(const uint32_t n, float * restrict s0, float * restrict s1, const void * restrict vx, const void * restrict vy0, const void * restrict vy1, uint32_t valid_rows, const float * restrict sz0, const float * restrict sz1) {
+    const uint8_t * restrict tile_ptr = vx;
+    const uint8_t * restrict y0_q = vy0;
+    const uint8_t * restrict y1_q = vy1;
+
+    HVX_Vector v_sum_float_c0 = Q6_V_vzero();
+    HVX_Vector v_sum_float_c1 = Q6_V_vzero();
+    HVX_Vector i4 = Q6_Vb_vsplat_R(4);
+
+    uint32_t n_k_tiles = n / 32;
+    for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
+        const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 512);
+        const HVX_Vector * restrict v_act0 = (const HVX_Vector *) (y0_q + kt * 1152);
+        const HVX_Vector * restrict v_act1 = (const HVX_Vector *) (y1_q + kt * 1152);
+
+        HVX_VectorPair v_sums0, v_sums1;
+        accum_q3_k_32x2(vptr, v_act0, v_act1, i4, &v_sums0, &v_sums1);
+
+        v_sum_float_c0 = hvx_vec_add_f32_f32(v_sum_float_c0, scale_q6_k_32x1(v_sums0, vptr[3], v_act0[8]));
+        v_sum_float_c1 = hvx_vec_add_f32_f32(v_sum_float_c1, scale_q6_k_32x1(v_sums1, vptr[3], v_act1[8]));
     }
 
     if (sz0) {
