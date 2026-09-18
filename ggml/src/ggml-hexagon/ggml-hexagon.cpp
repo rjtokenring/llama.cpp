@@ -105,6 +105,7 @@ static int opt_opbatch  = 1280; // max number of ops in a batch
 static int opt_opqueue  = 32;   // max number of pending batches
 static int opt_optrace  = 0;    // trace buffer size per thread (0 means default)
 static int opt_oppoll   = 0;    // polling for batch completions
+static int opt_hbcheck  = 0;    // every N responses log the DSP progress record (validates the heartbeat channel)
 static int opt_opfusion = 1;    // enable/disable op fusion
 
 enum ggml_hexagon_fusion_flags {
@@ -464,6 +465,7 @@ struct ggml_hexagon_session {
     ggml_backend_dev_t                     dev       = nullptr;
     ggml_backend_hexagon_device_context *  dev_ctx   = nullptr;
     ggml_hexagon_fence_buffer *            fence_buf = nullptr;
+    ggml_hexagon_shared_buffer *           hb_buf    = nullptr; // DSP progress record (struct htp_heartbeat), uncached
 
     ggml_hexagon_session(const ggml_hexagon_device_config & config, ggml_backend_dev_t dev = nullptr, uint32_t mdev_idx = 0, uint32_t mdev_count = 0) noexcept(false);
     ~ggml_hexagon_session() noexcept(true);
@@ -550,8 +552,8 @@ struct ggml_hexagon_rpcmem_block {
 
     std::unordered_set<ggml_hexagon_session *> mapped_clones;
 
-    ggml_hexagon_rpcmem_block(size_t size) {
-        base = (uint8_t *) rpcmem_alloc2(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size);
+    ggml_hexagon_rpcmem_block(size_t size, uint32_t rpc_flags = RPCMEM_DEFAULT_FLAGS) {
+        base = (uint8_t *) rpcmem_alloc2(RPCMEM_HEAP_ID_SYSTEM, rpc_flags, size);
         if (!base) {
             throw std::runtime_error("ggml-hex: rpcmem_alloc failed");
         }
@@ -577,6 +579,7 @@ struct ggml_hexagon_shared_buffer {
     bool     mapped;
     bool     pinned;
 
+    uint32_t rpc_flags = RPCMEM_DEFAULT_FLAGS; // rpcmem_alloc2 flags (cached by default)
     const char * c_name() const { return sess->c_name(); }
     uint8_t *    base()   const { return mem ? mem->base : nullptr; }
     size_t       size()   const { return mem ? mem->size : 0;  }
@@ -620,7 +623,7 @@ struct ggml_hexagon_shared_buffer {
     void alloc(size_t size) {
         if (this->mem) return;
 
-        this->mem = std::make_shared<ggml_hexagon_rpcmem_block>(size);
+        this->mem = std::make_shared<ggml_hexagon_rpcmem_block>(size, rpc_flags);
 
         HEX_VERBOSE("ggml-hex: %s allocated buffer: base %p size %zu fd %d pinned %d\n", sess->c_name(),
                     (void *) base(), this->size(), fd(), (int) pinned);
@@ -635,10 +638,11 @@ struct ggml_hexagon_shared_buffer {
         this->mem  = nullptr;
     }
 
-    ggml_hexagon_shared_buffer(ggml_hexagon_session * sess, size_t size, bool pinned = false) {
+    ggml_hexagon_shared_buffer(ggml_hexagon_session * sess, size_t size, bool pinned = false, uint32_t rpc_flags = RPCMEM_DEFAULT_FLAGS) {
         this->sess   = sess;
         this->mapped = false;
         this->pinned = pinned;
+        this->rpc_flags = rpc_flags;
 
         // Size adjustment inside the buffer class: 4K aligned data size + 4K guard page
         size_t guard_offset = (size + 4095) & ~4095;
@@ -2169,6 +2173,11 @@ struct ggml_hexagon_opbatch {
         t_map.clear();
         d_map.clear();
         ops.resize(n_ops_max);
+
+        // every batch carries the session's progress record so the DSP can always locate it
+        if (sess->hb_buf) {
+            add_buffer(sess->hb_buf, HTP_BUF_FLAG_HEARTBEAT);
+        }
     }
 
     ggml_hexagon_opbatch(ggml_hexagon_session *sess, size_t batch_size, size_t max_vmem) {
@@ -2199,7 +2208,7 @@ struct ggml_hexagon_opbatch {
     bool empty() const { return n_ops == 0; }
 
     // add buffer and return its index
-    int add_buffer(ggml_hexagon_shared_buffer * sbuf) {
+    int add_buffer(ggml_hexagon_shared_buffer * sbuf, uint32_t flags = 0) {
         // Lookup by fd
         auto it = b_map.find(sbuf->fd());
         if (it != b_map.end()) { return it->second; }
@@ -2211,9 +2220,10 @@ struct ggml_hexagon_opbatch {
         b_map.insert({sbuf->fd(), bi});
 
         htp_buf_desc &b = h_bufs[bi];
-        b.base = (uint64_t) sbuf->base();
-        b.fd   = sbuf->fd();
-        b.size = sbuf->size();
+        b.base  = (uint64_t) sbuf->base();
+        b.fd    = sbuf->fd();
+        b.size  = sbuf->size();
+        b.flags = flags;
 
         b_vmem += b.size;
 
@@ -3209,6 +3219,72 @@ struct ggml_hexagon_opqueue {
     }
 };
 
+// Registry of live sessions for the stall report
+static std::mutex                            g_hb_mutex;
+static std::vector<ggml_hexagon_session *>   g_hb_sessions;
+
+static void ggml_hexagon_hb_register(ggml_hexagon_session * sess, bool add) {
+    std::lock_guard<std::mutex> lock(g_hb_mutex);
+    auto it = std::find(g_hb_sessions.begin(), g_hb_sessions.end(), sess);
+    if (add && it == g_hb_sessions.end()) {
+        g_hb_sessions.push_back(sess);
+    } else if (!add && it != g_hb_sessions.end()) {
+        g_hb_sessions.erase(it);
+    }
+}
+
+static const char * ggml_hexagon_hb_stage_str(uint32_t stage) {
+    switch (stage) {
+        case HTP_HB_NONE:          return "none";
+        case HTP_HB_VTCM_ACQUIRE:  return "vtcm-acquire";
+        case HTP_HB_VTCM_HELD:     return "vtcm-held";
+        case HTP_HB_BATCH_START:   return "batch-start";
+        case HTP_HB_OP_START:      return "op-start";
+        case HTP_HB_OP_DONE:       return "op-done";
+        case HTP_HB_BATCH_DONE:    return "batch-done";
+        case HTP_HB_RSP_SENT:      return "rsp-sent";
+        case HTP_HB_VTCM_RELEASED: return "vtcm-released";
+        case HTP_HB_VTCM_FAILED:   return "vtcm-FAILED";
+        case HTP_HB_PEEK:          return "peek";
+        case HTP_HB_PEEK_ERROR:    return "peek-ERROR";
+        case HTP_HB_MAIN_EXIT:     return "main-EXIT";
+        default:                   return "?";
+    }
+}
+
+static void ggml_hexagon_hb_log(const char * prefix, const ggml_hexagon_session * s) {
+    // queue occupancy as seen by the host: requests written but not yet read by the DSP, responses not yet read by us
+    uint64_t q_req = 0, q_rsp = 0, q_req_bytes = 0;
+    if (s->valid_queue) {
+        dspqueue_get_stat(s->queue, DSPQUEUE_STAT_WRITE_QUEUE_PACKETS, &q_req);
+        dspqueue_get_stat(s->queue, DSPQUEUE_STAT_WRITE_QUEUE_BYTES,   &q_req_bytes);
+        dspqueue_get_stat(s->queue, DSPQUEUE_STAT_READ_QUEUE_PACKETS,  &q_rsp);
+    }
+    const volatile htp_heartbeat * hb = s->hb_buf ? (const volatile htp_heartbeat *) s->hb_buf->base() : nullptr;
+    if (!hb || hb->magic != HTP_HB_MAGIC) {
+        GGML_LOG_ERROR("%s%s req-seq %llu rsp-seq %llu : queue req-pending %llu (%llu bytes) rsp-pending %llu : no heartbeat yet\n", prefix, s->c_name(),
+                       (unsigned long long) s->batch_req_seq, (unsigned long long) s->batch_rsp_seq,
+                       (unsigned long long) q_req, (unsigned long long) q_req_bytes, (unsigned long long) q_rsp);
+        return;
+    }
+    GGML_LOG_ERROR("%s%s req-seq %llu rsp-seq %llu : queue req-pending %llu (%llu bytes) rsp-pending %llu : dsp count %u stage %s batch-seq %u op %u/%u opcode %u aux 0x%x\n", prefix,
+                   s->c_name(), (unsigned long long) s->batch_req_seq, (unsigned long long) s->batch_rsp_seq,
+                   (unsigned long long) q_req, (unsigned long long) q_req_bytes, (unsigned long long) q_rsp,
+                   hb->count, ggml_hexagon_hb_stage_str(hb->stage), hb->seq, hb->op_idx, hb->n_ops, hb->opcode, hb->aux);
+}
+
+// Called from flush_pending when a response is overdue: where is every DSP session right now?
+static void ggml_hexagon_dump_stall(const ggml_hexagon_session * waiter, int secs) {
+    std::lock_guard<std::mutex> lock(g_hb_mutex);
+    GGML_LOG_ERROR("ggml-hex: %s STALL : no response for %d s : DSP progress of all sessions follows\n", waiter->c_name(), secs);
+    for (auto * s : g_hb_sessions) {
+        ggml_hexagon_hb_log("ggml-hex:   ", s);
+        for (auto & sub : s->mdev.sessions) {
+            ggml_hexagon_hb_log("ggml-hex:     ", sub.get());
+        }
+    }
+}
+
 void ggml_hexagon_session::flush_peers() {
     auto vpeers = std::move(virt_peers);
     virt_peers.clear();
@@ -3240,6 +3316,8 @@ void ggml_hexagon_session::flush_pending(bool all) {
         }
     }
 
+    int n_expired = 0;
+
     while (this->batch_rsp_seq < this->batch_req_seq) {
         struct htp_opbatch_rsp rsp;
         uint32_t               rsp_size;
@@ -3258,7 +3336,17 @@ void ggml_hexagon_session::flush_pending(bool all) {
         if (opt_profile) {
             this->prof_wait_usec += (uint64_t) (ggml_time_us() - wait_start);
         }
-        if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK) {
+        if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK || err == AEE_EINTERRUPTED) { // DIAG: retry to keep the process alive and read the heartbeat
+            // DSPQUEUE_TIMEOUT is 1 s: report at 5 s, then every 5 s up to a minute, then every minute
+            // DIAG: EINTERRUPTED returns at once, so pace the report by wall time instead of by timeouts
+            static int64_t first_fail = 0, last_dump = 0;
+            const int64_t now = ggml_time_us();
+            if (!first_fail) first_fail = now;
+            if (now - last_dump >= 5000000) {
+                last_dump = now;
+                GGML_LOG_ERROR("ggml-hex: %s dspqueue_read err 0x%08x for %lld s\n", c_name(), (unsigned) err, (long long) ((now - first_fail) / 1000000));
+                ggml_hexagon_dump_stall(this, (int) ((now - first_fail) / 1000000));
+            }
             continue;
         }
 
@@ -3283,6 +3371,10 @@ void ggml_hexagon_session::flush_pending(bool all) {
 
         GGML_ASSERT(rsp.seq == this->batch_rsp_seq + 1);
         this->batch_rsp_seq = rsp.seq;
+
+        if (opt_hbcheck && (rsp.seq % opt_hbcheck) == 0) {
+            ggml_hexagon_hb_log("ggml-hex: hb-check ", this); // expected: stage rsp-sent, batch-seq == rsp-seq
+        }
 
         if (!all) break;
     }
@@ -3885,6 +3977,11 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
         this->mdev_fence_slot = this->alloc_fence(this->mdev.count);
     }
 
+    // Uncached so that the host sees the DSP's writes while a batch is still running
+    this->hb_buf = new ggml_hexagon_shared_buffer(this, 4096, true /* pinned */, RPCMEM_FLAG_UNCACHED);
+    memset(this->hb_buf->base(), 0, this->hb_buf->size());
+    ggml_hexagon_hb_register(this, true);
+
     if (!opt_vmem) {
         opt_vmem = ggml_hexagon_measure_max_vmem(this);
         GGML_LOG_INFO("ggml-hex: %s measured max vmem %zu\n", this->c_name(), opt_vmem);
@@ -3951,6 +4048,11 @@ void ggml_hexagon_session::release() noexcept(true) {
         delete this->fence_buf;
         this->fence_buf = nullptr;
     }
+    if (this->hb_buf) {
+        ggml_hexagon_hb_register(this, false);
+        delete this->hb_buf;
+        this->hb_buf = nullptr;
+    }
     while (!this->cloned_buffers.empty()) {
         release_buffer(this->cloned_buffers.begin()->second.get());
     }
@@ -3990,6 +4092,7 @@ ggml_hexagon_session::ggml_hexagon_session(const ggml_hexagon_device_config & co
     op_batch         = nullptr;
     op_queue         = nullptr;
     fence_buf        = nullptr;
+    hb_buf           = nullptr;
     fence_seq        = ((uintptr_t)this) & 0xFFFF;
 
     try {
@@ -7228,6 +7331,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_opbatch  = getenv("GGML_HEXAGON_OPBATCH");
     const char * str_opqueue  = getenv("GGML_HEXAGON_OPQUEUE");
     const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
+    const char * str_hbcheck  = getenv("GGML_HEXAGON_HBCHECK");
     const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
@@ -7279,6 +7383,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_opqueue   = str_opqueue  ? strtoul(str_opqueue, NULL, 0)          : opt_opqueue;
     opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * 256);
     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
+    opt_hbcheck   = str_hbcheck  ? strtoul(str_hbcheck, NULL, 0)          : opt_hbcheck;
     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;

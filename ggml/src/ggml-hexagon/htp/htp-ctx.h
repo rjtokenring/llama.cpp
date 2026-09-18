@@ -121,6 +121,8 @@ struct htp_context {
     struct htp_mdev_group  mdev;
     struct htp_ops_context octx;
 
+    volatile struct htp_heartbeat * hb;  // progress record for the host (NULL until a batch carries one)
+
     qurt_thread_t          main_thread;
     void *                 main_stack;
     atomic_bool            killed;

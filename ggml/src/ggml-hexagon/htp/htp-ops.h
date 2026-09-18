@@ -147,8 +147,42 @@ struct htp_tensor {
 struct htp_buf_desc {
     uint64_t base;     // base address
     uint64_t size;     // total size
-    uint32_t flags;    // buffer flags (unused)
+    uint32_t flags;    // buffer flags (HTP_BUF_FLAG_...)
     uint32_t fd;       // file descriptor
+};
+
+// Buffer flags
+#define HTP_BUF_FLAG_HEARTBEAT (1U << 0) // holds the DSP progress record below (diagnostics)
+
+// DSP progress record. One per session, in an uncached shared buffer the host adds to every batch.
+// The DSP updates it at each stage so that the host can tell where the DSP is when a response never comes.
+enum htp_hb_stage {
+    HTP_HB_NONE          = 0,
+    HTP_HB_VTCM_ACQUIRE  = 1,  // about to acquire VTCM/HMX (may block on the other session)
+    HTP_HB_VTCM_HELD     = 2,  // acquired
+    HTP_HB_BATCH_START   = 3,  // buffers/tensors prepared, about to run ops
+    HTP_HB_OP_START      = 4,  // running op op_idx (opcode)
+    HTP_HB_OP_DONE       = 5,  // op op_idx returned (aux = status)
+    HTP_HB_BATCH_DONE    = 6,  // all ops done, about to write the response
+    HTP_HB_RSP_SENT      = 7,  // response written (aux = dspqueue_write error)
+    HTP_HB_VTCM_RELEASED = 8,  // left process_ops, VTCM released
+    HTP_HB_VTCM_FAILED   = 9,  // acquire failed (aux = error), about to abort
+    HTP_HB_PEEK          = 10, // main thread waiting for a request (dspqueue_peek), aux = last peek result
+    HTP_HB_PEEK_ERROR    = 11, // dspqueue_peek failed (aux = error): main thread is about to exit
+    HTP_HB_MAIN_EXIT     = 12, // main thread stopped
+};
+
+#define HTP_HB_MAGIC 0x48544248u
+
+struct htp_heartbeat {
+    uint32_t magic;    // HTP_HB_MAGIC
+    uint32_t count;    // incremented on every update
+    uint32_t stage;    // enum htp_hb_stage
+    uint32_t seq;      // low 32 bits of the batch sequence
+    uint32_t op_idx;   // op index within the batch
+    uint32_t opcode;   // htp_op_code of that op
+    uint32_t n_ops;    // ops in the batch
+    uint32_t aux;      // stage specific
 };
 
 enum htp_op_flags {

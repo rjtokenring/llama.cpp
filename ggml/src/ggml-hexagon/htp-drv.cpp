@@ -91,6 +91,8 @@ dspqueue_create_pfn_t       dspqueue_create_pfn       = nullptr;
 dspqueue_close_pfn_t        dspqueue_close_pfn        = nullptr;
 dspqueue_export_pfn_t       dspqueue_export_pfn       = nullptr;
 dspqueue_write_pfn_t        dspqueue_write_pfn        = nullptr;
+typedef AEEResult (*dspqueue_get_stat_pfn_t)(dspqueue_t queue, enum dspqueue_stat stat, uint64_t *value);
+dspqueue_get_stat_pfn_t     dspqueue_get_stat_pfn     = nullptr;
 dspqueue_read_pfn_t         dspqueue_read_pfn         = nullptr;
 dspqueue_read_noblock_pfn_t dspqueue_read_noblock_pfn = nullptr;
 
@@ -163,6 +165,14 @@ AEEResult dspqueue_write(dspqueue_t               queue,
                          const uint8_t *          message,
                          uint32_t                 timeout_us) {
     return dspqueue_write_pfn(queue, flags, num_buffers, buffers, message_length, message, timeout_us);
+}
+
+AEEResult dspqueue_get_stat(dspqueue_t queue, enum dspqueue_stat stat, uint64_t * value) {
+    if (!dspqueue_get_stat_pfn) {
+        *value = 0;
+        return AEE_EUNSUPPORTED;
+    }
+    return dspqueue_get_stat_pfn(queue, stat, value);
 }
 
 AEEResult dspqueue_read(dspqueue_t               queue,
@@ -368,6 +378,7 @@ int htpdrv_init() {
     dlsym(handle.get(), dspqueue_close_pfn_t, dspqueue_close_pfn, dspqueue_close, false);
     dlsym(handle.get(), dspqueue_export_pfn_t, dspqueue_export_pfn, dspqueue_export, false);
     dlsym(handle.get(), dspqueue_write_pfn_t, dspqueue_write_pfn, dspqueue_write, false);
+    dlsym(handle.get(), dspqueue_get_stat_pfn_t, dspqueue_get_stat_pfn, dspqueue_get_stat, true); // optional, diagnostics only
     dlsym(handle.get(), dspqueue_read_pfn_t, dspqueue_read_pfn, dspqueue_read, false);
     dlsym(handle.get(), dspqueue_read_noblock_pfn_t, dspqueue_read_noblock_pfn, dspqueue_read_noblock, false);
     dlsym(handle.get(), remote_handle64_open_pfn_t, remote_handle64_open_pfn, remote_handle64_open, false);

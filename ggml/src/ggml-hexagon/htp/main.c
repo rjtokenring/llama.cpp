@@ -242,13 +242,18 @@ AEEResult htp_iface_munmap(remote_handle64 handle, uint32 fd) {
     return AEE_SUCCESS;
 }
 
+static inline void hb_update(struct htp_context *ctx, uint32_t stage, uint32_t seq, uint32_t op_idx, uint32_t opcode, uint32_t n_ops, uint32_t aux);
+
 static void vtcm_acquire(struct htp_context * ctx) {
     if (!ctx->vtcm_valid) {
+        hb_update(ctx, HTP_HB_VTCM_ACQUIRE, 0, 0, 0, 0, 0);
         int err = HAP_compute_res_acquire_cached(ctx->vtcm_rctx, 10000000u);
         if (err != 0) {
             FARF(ERROR, "ggml-hex: failed to acquire VTCM: 0x%08x", (unsigned)err);
+            hb_update(ctx, HTP_HB_VTCM_FAILED, 0, 0, 0, 0, (uint32_t) err);
             abort();
         }
+        hb_update(ctx, HTP_HB_VTCM_HELD, 0, 0, 0, 0, 0);
 
         ctx->vtcm_needs_release = false;
         ctx->vtcm_valid = true;
@@ -263,6 +268,7 @@ static void vtcm_release(struct htp_context * ctx) {
         ctx->vtcm_valid         = false;
         ctx->vtcm_needs_release = false;
         HAP_compute_res_release_cached(ctx->vtcm_rctx);
+        hb_update(ctx, HTP_HB_VTCM_RELEASED, 0, 0, 0, 0, 0);
     }
 }
 
@@ -303,6 +309,7 @@ static int vtcm_alloc(struct htp_context * ctx) {
     ctx->vtcm_rctx          = rctx;
     ctx->vtcm_valid         = false;
     ctx->vtcm_needs_release = false;
+    ctx->hb                 = NULL;
 
     return 0;
 }
@@ -911,9 +918,19 @@ static inline bool reuse_buf(struct htp_context *ctx, uint32_t *m_reuse, struct 
     return false;
 }
 
+static inline void hb_update(struct htp_context *ctx, uint32_t stage, uint32_t seq, uint32_t op_idx, uint32_t opcode, uint32_t n_ops, uint32_t aux) {
+    volatile struct htp_heartbeat *hb = ctx->hb;
+    if (!hb) return;
+    hb->magic = HTP_HB_MAGIC; hb->stage = stage; hb->seq = seq; hb->op_idx = op_idx;
+    hb->opcode = opcode; hb->n_ops = n_ops; hb->aux = aux; hb->count = hb->count + 1;
+    qurt_mem_cache_clean((qurt_addr_t) hb, sizeof(*hb), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+}
+
 static inline void drop_mmap(struct htp_context *ctx, struct htp_mmap *m) {
     if (m->size) {
         FARF(ALWAYS, "unmap : fd %u base %p size %u", m->fd, (void*) m->base, (uint32_t) m->size);
+        const uint64_t hb = (uint64_t) (uintptr_t) ctx->hb;
+        if (hb >= m->base && hb < m->base + m->size) { ctx->hb = NULL; }
         htp_munmap((void *) m->base, m->size);
         m->size = 0;
         m->base = 0;
@@ -1142,6 +1159,11 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     prep_op_bufs(ctx, bufs, n_bufs);
     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_BUFF, 0);
 
+    for (uint32_t i = 0; i < n_bufs; i++) {
+        if (bufs[i].flags & HTP_BUF_FLAG_HEARTBEAT) { ctx->hb = (volatile struct htp_heartbeat *) (uintptr_t) bufs[i].base; }
+    }
+    hb_update(ctx, HTP_HB_BATCH_START, (uint32_t) req->seq, 0, 0, n_ops, 0);
+
     prep_tensors(ctx, bufs, tens, n_tens);
 
     struct htp_ops_context *octx = &ctx->octx;
@@ -1164,7 +1186,9 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
 
         profile_start(ctx->profiler, &prof);
 
+        hb_update(ctx, HTP_HB_OP_START, (uint32_t) req->seq, i, ops[i].opcode, n_ops, 0);
         op_status = proc_op_req(octx, bufs, n_bufs, tens, i, &ops[i]);
+        hb_update(ctx, HTP_HB_OP_DONE, (uint32_t) req->seq, i, ops[i].opcode, n_ops, (uint32_t) op_status);
 
         profile_stop(ctx->profiler, &prof);
 
@@ -1216,10 +1240,12 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     struct dspqueue_buffer write_dbuf = *dbuf;
     write_dbuf.flags = DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
 
+    hb_update(ctx, HTP_HB_BATCH_DONE, (uint32_t) req->seq, n_ops, 0, n_ops, (uint32_t) octx->status);
     err = dspqueue_write(queue, 0, 1, &write_dbuf, sizeof(rsp), (const uint8_t *) &rsp, DSPQUEUE_TIMEOUT_NONE);
     if (err != 0) {
         FARF(ERROR, "dspqueue_write failed: 0x%08x", (unsigned) err);
     }
+    hb_update(ctx, HTP_HB_RSP_SENT, (uint32_t) req->seq, n_ops, 0, n_ops, (uint32_t) err);
 }
 
 #define DSPQUEUE_READ_TIMEOUT_USEC 5000
@@ -1292,6 +1318,7 @@ static void htp_main_thread(void * context) {
         uint32_t num_buffers = 0;
         uint32_t message_length = 0;
 
+        hb_update(ctx, HTP_HB_PEEK, 0, 0, 0, n_errors, (uint32_t) last_err);
         int err = dspqueue_peek(ctx->dsp_queue, &flags, &num_buffers, &message_length, 50000);
         if (err == 0) {
             last_err = 0; n_errors = 0; log_at = 1;
