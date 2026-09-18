@@ -8876,6 +8876,7 @@ static const ggml_type base_types[] = {
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q4_1, // for I8MM tests
     GGML_TYPE_Q4_K,
+    GGML_TYPE_Q3_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, // LOCAL hexagon K-quant coverage, do not commit
     GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, // TODO: or "other"
     GGML_TYPE_IQ2_XXS
 };
@@ -11167,6 +11168,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, bs, 4096, {1, 1}, {1, 1}));
+        }
+    }
+
+    // LOCAL hexagon K-quant perf, do not commit: same shape family as the q4_1/q5_K/q6_K rows measured on the board
+    for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K}) {
+        for (int bs : {1, 2, 3, 4, 5, 8}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, bs, 14336, {1, 1}, {1, 1}));
         }
     }
 

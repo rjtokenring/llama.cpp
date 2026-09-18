@@ -36,6 +36,11 @@ extern "C" {
 //   vector 4: high bit, bit g of a byte holds the 5th bit of group g
 //   vector 5: fp16 per row, lane 2*row = d * scale, lane 2*row+1 = -(dmin * min)
 #define HTP_MM_WEIGHT_TILE_SIZE_Q5_K   768
+// Q3_K native 3-bit tile (32 rows x 32 k), two scales per row like Q6_K.
+//   vectors 0..1: low 2 bits, vector m holds groups 4m..4m+3 at bit offsets 0,2,4,6
+//   vector 2: high bit, bit g of a byte holds the 3rd bit of group g
+//   vector 3: fp16 scales per row, d * (scales[] - 32): k 0..15 in lanes 0..31, k 16..31 in lanes 32..63
+#define HTP_MM_WEIGHT_TILE_SIZE_Q3_K   512
 
 // --- Weight Repacked Aligned Tile Sizes ---
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0   640
@@ -45,6 +50,7 @@ extern "C" {
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_MXFP4  640
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q6_K   896
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q5_K   768
+#define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q3_K   512
 
 // --- Activation Tiled Block Sizes (including padding) ---
 #define HTP_MM_ACT_TILE_SIZE_Q8_0      1152
@@ -210,6 +216,7 @@ static inline bool htp_mm_is_repack_type(int weight_type) {
         case HTP_TYPE_Q8_0:
         case HTP_TYPE_IQ4_NL:
         case HTP_TYPE_MXFP4:
+        case HTP_TYPE_Q3_K:
         case HTP_TYPE_Q4_K:
         case HTP_TYPE_Q5_K:
         case HTP_TYPE_Q6_K:
@@ -239,6 +246,8 @@ static inline uint32_t htp_mm_get_weight_tile_size(int weight_type) {
             return HTP_MM_WEIGHT_TILE_SIZE_Q5_K;
         case HTP_TYPE_Q6_K:
             return HTP_MM_WEIGHT_TILE_SIZE_Q6_K;
+        case HTP_TYPE_Q3_K:
+            return HTP_MM_WEIGHT_TILE_SIZE_Q3_K;
         case HTP_TYPE_MXFP4:
             return HTP_MM_WEIGHT_TILE_SIZE_MXFP4;
         default:
@@ -260,6 +269,8 @@ static inline uint32_t htp_mm_get_weight_aligned_tile_size(int weight_type) {
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q5_K;
         case HTP_TYPE_Q6_K:
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q6_K;
+        case HTP_TYPE_Q3_K:
+            return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q3_K;
         case HTP_TYPE_MXFP4:
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_MXFP4;
         default:
