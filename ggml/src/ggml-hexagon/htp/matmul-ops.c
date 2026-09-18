@@ -1409,8 +1409,9 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
                         src0->type == HTP_TYPE_Q4_K);
 
     // Compute src0_nrows_per_thread
+    // the fused add reads its src2 slice with aligned vector loads, so the slices must start at a multiple of 32 rows
     mmctx->src0_nrows_per_thread  = fastdiv(nrows + octx->n_threads - 1, &octx->n_threads_div);
-    if (is_repacked) {
+    if (is_repacked || src2) {
         mmctx->src0_nrows_per_thread = hex_round_up(mmctx->src0_nrows_per_thread, 32);
     } else {
         mmctx->src0_nrows_per_thread += (mmctx->src0_nrows_per_thread & 1); // round up to even
