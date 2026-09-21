@@ -541,73 +541,6 @@ static void dequantize_tiled_weight_to_fp16_task_q6_k(
     }
 }
 
-// Q5_K stores 5-bit weights and one fp16 scale/min pair per row, see HTP_MM_WEIGHT_TILE_SIZE_Q5_K.
-// A k-group holds 4 k per row, the HMX tile holds 2, so each group is dealt into two tiles.
-static void dequantize_tiled_weight_to_fp16_task_q5_k(
-        const tiled_dequantize_state_t *state,
-        uint32_t start_tile, uint32_t end_tile) {
-
-    const HVX_Vector mask_0f = Q6_Vb_vsplat_R(0x0F);
-    const HVX_Vector mask_01 = Q6_Vb_vsplat_R(0x01);
-
-    for (uint32_t t = start_tile; t < end_tile; t++) {
-        const HVX_Vector * vptr = (const HVX_Vector *) (state->src + t * state->aligned_tile_size);
-        __fp16 * dst_ptr = state->dst + t * HTP_MM_HMX_TILE_N_ELMS;
-
-        HVX_VectorPair dm_deal = Q6_W_vdeal_VVR(vptr[5], vptr[5], -2);
-        HVX_Vector vd = Q6_V_lo_W(dm_deal);
-        HVX_Vector vm = Q6_V_hi_W(dm_deal);
-
-        HVX_Vector v_scale_duplicated  = Q6_V_lo_W(Q6_W_vshuff_VVR(vd, vd, -2));
-        HVX_Vector v_offset_duplicated = Q6_V_lo_W(Q6_W_vshuff_VVR(vm, vm, -2));
-
-        #pragma unroll
-        for (int g = 0; g < 8; g++) {
-            HVX_Vector     v_q   = unpack_q5_k_group(vptr, g, mask_0f, mask_01);
-            HVX_VectorPair vp16  = Q6_Wh_vunpack_Vb(v_q);
-            HVX_VectorPair vp_k  = Q6_W_vdeal_VVR(Q6_V_hi_W(vp16), Q6_V_lo_W(vp16), -4);
-
-            hvx_vmem(dst_ptr + (2 * g + 0) * 64) = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_Vqf16Vhf(
-                Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(vp_k)), v_scale_duplicated), v_offset_duplicated));
-            hvx_vmem(dst_ptr + (2 * g + 1) * 64) = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_Vqf16Vhf(
-                Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_hi_W(vp_k)), v_scale_duplicated), v_offset_duplicated));
-        }
-    }
-}
-
-// Q4_K stores 4-bit weights and one fp16 scale/min pair per row, see HTP_MM_WEIGHT_TILE_SIZE_Q4_K.
-// A k-group holds 4 k per row, the HMX tile holds 2, so each group is dealt into two tiles.
-static void dequantize_tiled_weight_to_fp16_task_q4_k(
-        const tiled_dequantize_state_t *state,
-        uint32_t start_tile, uint32_t end_tile) {
-
-    const HVX_Vector mask_0f = Q6_Vb_vsplat_R(0x0F);
-
-    for (uint32_t t = start_tile; t < end_tile; t++) {
-        const HVX_Vector * vptr = (const HVX_Vector *) (state->src + t * state->aligned_tile_size);
-        __fp16 * dst_ptr = state->dst + t * HTP_MM_HMX_TILE_N_ELMS;
-
-        HVX_VectorPair dm_deal = Q6_W_vdeal_VVR(vptr[4], vptr[4], -2);
-        HVX_Vector vd = Q6_V_lo_W(dm_deal);
-        HVX_Vector vm = Q6_V_hi_W(dm_deal);
-
-        HVX_Vector v_scale_duplicated  = Q6_V_lo_W(Q6_W_vshuff_VVR(vd, vd, -2));
-        HVX_Vector v_offset_duplicated = Q6_V_lo_W(Q6_W_vshuff_VVR(vm, vm, -2));
-
-        #pragma unroll
-        for (int g = 0; g < 8; g++) {
-            HVX_Vector     v_q   = unpack_kq_lo_nibbles(vptr, g, mask_0f);
-            HVX_VectorPair vp16  = Q6_Wh_vunpack_Vb(v_q);
-            HVX_VectorPair vp_k  = Q6_W_vdeal_VVR(Q6_V_hi_W(vp16), Q6_V_lo_W(vp16), -4);
-
-            hvx_vmem(dst_ptr + (2 * g + 0) * 64) = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_Vqf16Vhf(
-                Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(vp_k)), v_scale_duplicated), v_offset_duplicated));
-            hvx_vmem(dst_ptr + (2 * g + 1) * 64) = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_Vqf16Vhf(
-                Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_hi_W(vp_k)), v_scale_duplicated), v_offset_duplicated));
-        }
-    }
-}
-
 static __attribute__((noinline))
 void convert_f16_weight_to_fp16_tiles_task(
         const tiled_dequantize_state_t *state,
@@ -905,15 +838,12 @@ static void transfer_output_chunk_fp16_to_fp32_col_chunk(
             HVX_Vector v = ((const HVX_Vector *) tile)[r1];
             HVX_VectorPair vp = Q6_Wqf32_vmpy_VhfVhf(v, one);
 
-            HVX_Vector *pv_out0 = (HVX_Vector *) (output_row_base + c + 0);
-            HVX_Vector *pv_out1 = (HVX_Vector *) (output_row_base + c + dst_stride);
-
             HVX_Vector v_out0 = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(vp));
             if (src2_row_base) {
                 HVX_Vector v_src2_0 = hvx_vmemu(src2_row_base + c + 0);
                 v_out0 = hvx_vec_add_f32_f32(v_out0, v_src2_0);
             }
-            *pv_out0 = v_out0;
+            hvx_vmemu(output_row_base + c + 0) = v_out0;
 
             if (r + 1 < n_rows) {
                 HVX_Vector v_out1 = Q6_Vsf_equals_Vqf32(Q6_V_hi_W(vp));
@@ -921,7 +851,7 @@ static void transfer_output_chunk_fp16_to_fp32_col_chunk(
                     HVX_Vector v_src2_1 = hvx_vmemu(src2_row_base + c + src2_stride);
                     v_out1 = hvx_vec_add_f32_f32(v_out1, v_src2_1);
                 }
-                *pv_out1 = v_out1;
+                hvx_vmemu(output_row_base + c + dst_stride) = v_out1;
             }
         }
 
@@ -1468,12 +1398,9 @@ static void transfer_output_chunk_fp16_to_fp32_scattered(
             HVX_Vector v = ((const HVX_Vector *) tile)[r1];
             HVX_VectorPair vp = Q6_Wqf32_vmpy_VhfVhf(v, one);
 
-            HVX_Vector *pv_out0 = (HVX_Vector *) (output_row0 + c);
-            HVX_Vector *pv_out1 = output_row1 ? (HVX_Vector *) (output_row1 + c) : NULL;
-
-            *pv_out0 = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(vp));
-            if (pv_out1) {
-                *pv_out1 = Q6_Vsf_equals_Vqf32(Q6_V_hi_W(vp));
+            hvx_vmemu(output_row0 + c) = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(vp));
+            if (output_row1) {
+                hvx_vmemu(output_row1 + c) = Q6_Vsf_equals_Vqf32(Q6_V_hi_W(vp));
             }
         }
     }
