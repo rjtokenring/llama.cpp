@@ -506,6 +506,40 @@ static void dequantize_tiled_weight_to_fp16_task_q8_0(
     }
 }
 
+// Q5_K stores 5-bit weights and one fp16 scale/min pair per row, see HTP_MM_WEIGHT_TILE_SIZE_Q5_K.
+// A k-group holds 4 k per row, the HMX tile holds 2, so each group is dealt into two tiles.
+static void dequantize_tiled_weight_to_fp16_task_q5_k(
+        const tiled_dequantize_state_t *state,
+        uint32_t start_tile, uint32_t end_tile) {
+
+    const HVX_Vector mask_0f = Q6_Vb_vsplat_R(0x0F);
+    const HVX_Vector mask_01 = Q6_Vb_vsplat_R(0x01);
+
+    for (uint32_t t = start_tile; t < end_tile; t++) {
+        const HVX_Vector * vptr = (const HVX_Vector *) (state->src + t * state->aligned_tile_size);
+        __fp16 * dst_ptr = state->dst + t * HTP_MM_HMX_TILE_N_ELMS;
+
+        HVX_VectorPair dm_deal = Q6_W_vdeal_VVR(vptr[5], vptr[5], -2);
+        HVX_Vector vd = Q6_V_lo_W(dm_deal);
+        HVX_Vector vm = Q6_V_hi_W(dm_deal);
+
+        HVX_Vector v_scale_duplicated  = Q6_V_lo_W(Q6_W_vshuff_VVR(vd, vd, -2));
+        HVX_Vector v_offset_duplicated = Q6_V_lo_W(Q6_W_vshuff_VVR(vm, vm, -2));
+
+        #pragma unroll
+        for (int g = 0; g < 8; g++) {
+            HVX_Vector     v_q  = unpack_q5_k_group(vptr, g, mask_0f, mask_01);
+            HVX_VectorPair vp16 = Q6_Wh_vunpack_Vb(v_q);
+            HVX_VectorPair vp_k = Q6_W_vdeal_VVR(Q6_V_hi_W(vp16), Q6_V_lo_W(vp16), -4);
+
+            hvx_vmem(dst_ptr + (2 * g + 0) * 64) = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_Vqf16Vhf(
+                Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(vp_k)), v_scale_duplicated), v_offset_duplicated));
+            hvx_vmem(dst_ptr + (2 * g + 1) * 64) = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_Vqf16Vhf(
+                Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_hi_W(vp_k)), v_scale_duplicated), v_offset_duplicated));
+        }
+    }
+}
+
 // Q6_K stores 6-bit weights and one fp16 scale per 16 k, see HTP_MM_WEIGHT_TILE_SIZE_Q6_K.
 // A k-group holds 4 k per row, the HMX tile holds 2, so each group is dealt into two tiles.
 static void dequantize_tiled_weight_to_fp16_task_q6_k(
