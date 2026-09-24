@@ -34,6 +34,8 @@ enum htp_data_type {
     HTP_TYPE_Q4_1_TILED,
     HTP_TYPE_Q8_0_TILED,
     HTP_TYPE_MXFP4_TILED,
+    HTP_TYPE_F16_TILED,   // F16/BF16 matmul weights repacked into HMX fp16 tiles
+    HTP_TYPE_F32_TILED,   // F32 matmul weights repacked into fp32 tiles
 
     HTP_TYPE_INVALID
 };

@@ -631,6 +631,40 @@ void quantize_f32_weight_to_fp16_tiles_task(
     }
 }
 
+// Repacked F16 weights are already in the HMX tile layout: plain copy into the weight area.
+static __attribute__((noinline))
+void copy_f16_weight_tiles_task(
+        const tiled_dequantize_state_t *state,
+        uint32_t start_tile, uint32_t end_tile) {
+
+    for (uint32_t t = start_tile; t < end_tile; t++) {
+        const HVX_Vector * restrict src = (const HVX_Vector *) (state->src + t * state->aligned_tile_size);
+        HVX_Vector * restrict dst = (HVX_Vector *) (state->dst + t * HTP_MM_HMX_TILE_N_ELMS);
+
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            dst[i] = src[i];
+        }
+    }
+}
+
+// Repacked F32 weights: vector k holds k of the 32 rows. Two of them make one HMX vector (row pairs of k).
+static __attribute__((noinline))
+void convert_f32_weight_tiles_to_fp16_task(
+        const tiled_dequantize_state_t *state,
+        uint32_t start_tile, uint32_t end_tile) {
+
+    for (uint32_t t = start_tile; t < end_tile; t++) {
+        const HVX_Vector * restrict src = (const HVX_Vector *) (state->src + t * state->aligned_tile_size);
+        HVX_Vector * restrict dst = (HVX_Vector *) (state->dst + t * HTP_MM_HMX_TILE_N_ELMS);
+
+        #pragma unroll
+        for (int cp = 0; cp < 16; cp++) {
+            dst[cp] = hvx_vec_f32_to_f16_shuff(src[2 * cp], src[2 * cp + 1]);
+        }
+    }
+}
+
 // --- End tiled dequantizers ---
 
 // dot-chunk functions require external HMX lock

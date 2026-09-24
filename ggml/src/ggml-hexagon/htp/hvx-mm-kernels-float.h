@@ -66,6 +66,82 @@ static inline void quantize_f16_f16_kernel(
     }
 }
 
+// Activations for the F16 tile kernels (see tiled_vec_dot_f16_32x1): each fp16 pair k = 2i, 2i+1 fills a whole
+// vector, so the dot kernel reads it with a vector load. tmp holds the fp16 row.
+static inline void hvx_splat_f16_pairs(uint8_t * restrict dst, const uint8_t * restrict src_f16, uint32_t ne0) {
+    const uint32_t * restrict p = (const uint32_t *) src_f16;
+    HVX_Vector * restrict d = (HVX_Vector *) dst;
+    for (uint32_t i = 0; i < ne0 / 2; i++) {
+        d[i] = Q6_V_vsplat_R(p[i]);
+    }
+}
+
+static inline void quantize_f32_f16_pairs_kernel(
+    const uint8_t * restrict src_data,
+    uint8_t * restrict dst_data,
+    uint8_t * restrict tmp_data,
+    uint32_t ne0,
+    uint32_t nrows,
+    size_t src_stride,
+    size_t dst_stride
+) {
+    const size_t src_row_size = ne0 * sizeof(float);
+    for (uint32_t i = 0; i < nrows; ++i) {
+        hex_l2fetch(src_data, src_row_size, src_stride, 2);
+        hvx_copy_f16_f32_au(tmp_data, src_data, ne0);
+        hvx_splat_f16_pairs(dst_data, tmp_data, ne0);
+
+        dst_data += dst_stride;
+        src_data += src_stride;
+    }
+}
+
+static inline void quantize_f16_f16_pairs_kernel(
+    const uint8_t * restrict src_data,
+    uint8_t * restrict dst_data,
+    uint8_t * restrict tmp_data,
+    uint32_t ne0,
+    uint32_t nrows,
+    size_t src_stride,
+    size_t dst_stride
+) {
+    const size_t src_row_size = ne0 * sizeof(__fp16);
+    for (uint32_t i = 0; i < nrows; ++i) {
+        hex_l2fetch(src_data, src_row_size, src_stride, 2);
+        hvx_copy_f16_au(tmp_data, src_data, ne0);
+        hvx_splat_f16_pairs(dst_data, tmp_data, ne0);
+
+        dst_data += dst_stride;
+        src_data += src_stride;
+    }
+}
+
+// Activations for the F32 tile kernels (see tiled_vec_dot_f32_32x1): each fp32 value fills a whole vector.
+static inline void quantize_f32_f32_splat_kernel(
+    const uint8_t * restrict src_data,
+    uint8_t * restrict dst_data,
+    uint8_t * restrict tmp_data,
+    uint32_t ne0,
+    uint32_t nrows,
+    size_t src_stride,
+    size_t dst_stride
+) {
+    const size_t src_row_size = ne0 * sizeof(float);
+    for (uint32_t i = 0; i < nrows; ++i) {
+        hex_l2fetch(src_data, src_row_size, src_stride, 2);
+        hvx_copy_f32_au(tmp_data, src_data, ne0);
+
+        const uint32_t * restrict p = (const uint32_t *) tmp_data;
+        HVX_Vector * restrict d = (HVX_Vector *) dst_data;
+        for (uint32_t k = 0; k < ne0; k++) {
+            d[k] = Q6_V_vsplat_R(p[k]);
+        }
+
+        dst_data += dst_stride;
+        src_data += src_stride;
+    }
+}
+
 // Float dot product kernels (HVX)
 
 #if __HVX_ARCH__ < 79

@@ -932,6 +932,100 @@ static void tiled_vec_dot_mxfp4_32x2(const uint32_t n, float * restrict s0, floa
     }
 }
 
+// F16 and F32 tiles (see HTP_MM_WEIGHT_TILE_SIZE_F16/F32) hold the 32 rows side by side, so one multiply advances
+// 32 outputs and no horizontal reduction is needed. k is a multiple of 32. Activations come already splatted:
+// fp16 pairs for F16 (quantize_f32_f16_pairs_kernel), fp32 values for F32 (quantize_f32_f32_splat_kernel).
+
+static void tiled_vec_dot_f16_32x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy, uint32_t valid_rows, const float * restrict sz) {
+    const HVX_Vector * restrict w = (const HVX_Vector *) vx;
+    const HVX_Vector * restrict a = (const HVX_Vector *) vy; // vector i: fp16 pair k = 2*i, 2*i+1 repeated
+
+    HVX_VectorPair acc = Q6_W_vzero();
+
+    const uint32_t n_kp = n / 2;
+    #pragma unroll(4)
+    for (uint32_t i = 0; i < n_kp; i++) {
+        acc = hvx_vec_mpyacc_f32_f16(acc, w[i], a[i]);
+    }
+
+    // lo holds the even k, hi the odd k of each row
+    HVX_Vector sum = hvx_vec_add_f32_f32(Q6_V_lo_W(acc), Q6_V_hi_W(acc));
+    if (sz) {
+        sum = hvx_vec_add_f32_f32(sum, hvx_vmemu(sz));
+    }
+    hvx_vec_store_u(s, valid_rows * sizeof(float), sum);
+}
+
+static void tiled_vec_dot_f16_32x2(const uint32_t n, float * restrict s0, float * restrict s1, const void * restrict vx, const void * restrict vy0, const void * restrict vy1, uint32_t valid_rows, const float * restrict sz0, const float * restrict sz1) {
+    const HVX_Vector * restrict w  = (const HVX_Vector *) vx;
+    const HVX_Vector * restrict a0 = (const HVX_Vector *) vy0;
+    const HVX_Vector * restrict a1 = (const HVX_Vector *) vy1;
+
+    HVX_VectorPair acc0 = Q6_W_vzero();
+    HVX_VectorPair acc1 = Q6_W_vzero();
+
+    const uint32_t n_kp = n / 2;
+    #pragma unroll(2)
+    for (uint32_t i = 0; i < n_kp; i++) {
+        const HVX_Vector v_w = w[i];
+        acc0 = hvx_vec_mpyacc_f32_f16(acc0, v_w, a0[i]);
+        acc1 = hvx_vec_mpyacc_f32_f16(acc1, v_w, a1[i]);
+    }
+
+    HVX_Vector sum0 = hvx_vec_add_f32_f32(Q6_V_lo_W(acc0), Q6_V_hi_W(acc0));
+    HVX_Vector sum1 = hvx_vec_add_f32_f32(Q6_V_lo_W(acc1), Q6_V_hi_W(acc1));
+    if (sz0) {
+        sum0 = hvx_vec_add_f32_f32(sum0, hvx_vmemu(sz0));
+    }
+    if (sz1) {
+        sum1 = hvx_vec_add_f32_f32(sum1, hvx_vmemu(sz1));
+    }
+    hvx_vec_store_u(s0, valid_rows * sizeof(float), sum0);
+    hvx_vec_store_u(s1, valid_rows * sizeof(float), sum1);
+}
+
+static void tiled_vec_dot_f32_32x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy, uint32_t valid_rows, const float * restrict sz) {
+    const HVX_Vector * restrict w = (const HVX_Vector *) vx;
+    const HVX_Vector * restrict a = (const HVX_Vector *) vy; // vector k: activation k repeated
+
+    HVX_Vector sum = Q6_V_vzero();
+
+    #pragma unroll(4)
+    for (uint32_t k = 0; k < n; k++) {
+        sum = hvx_vec_add_f32_f32(sum, hvx_vec_mul_f32_f32(w[k], a[k]));
+    }
+
+    if (sz) {
+        sum = hvx_vec_add_f32_f32(sum, hvx_vmemu(sz));
+    }
+    hvx_vec_store_u(s, valid_rows * sizeof(float), sum);
+}
+
+static void tiled_vec_dot_f32_32x2(const uint32_t n, float * restrict s0, float * restrict s1, const void * restrict vx, const void * restrict vy0, const void * restrict vy1, uint32_t valid_rows, const float * restrict sz0, const float * restrict sz1) {
+    const HVX_Vector * restrict w  = (const HVX_Vector *) vx;
+    const HVX_Vector * restrict a0 = (const HVX_Vector *) vy0;
+    const HVX_Vector * restrict a1 = (const HVX_Vector *) vy1;
+
+    HVX_Vector sum0 = Q6_V_vzero();
+    HVX_Vector sum1 = Q6_V_vzero();
+
+    #pragma unroll(2)
+    for (uint32_t k = 0; k < n; k++) {
+        const HVX_Vector v_w = w[k];
+        sum0 = hvx_vec_add_f32_f32(sum0, hvx_vec_mul_f32_f32(v_w, a0[k]));
+        sum1 = hvx_vec_add_f32_f32(sum1, hvx_vec_mul_f32_f32(v_w, a1[k]));
+    }
+
+    if (sz0) {
+        sum0 = hvx_vec_add_f32_f32(sum0, hvx_vmemu(sz0));
+    }
+    if (sz1) {
+        sum1 = hvx_vec_add_f32_f32(sum1, hvx_vmemu(sz1));
+    }
+    hvx_vec_store_u(s0, valid_rows * sizeof(float), sum0);
+    hvx_vec_store_u(s1, valid_rows * sizeof(float), sum1);
+}
+
 static inline void quantize_f32_q8_0_tiled_kernel(
     const uint8_t * restrict src_data,
     uint8_t * restrict dst_data,
