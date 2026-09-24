@@ -34,6 +34,13 @@ extern "C" {
 //   vector 6: fp16 scales per row, d * scales[]: k 0..15 in lanes 0..31, k 16..31 in lanes 32..63
 #define HTP_MM_WEIGHT_TILE_SIZE_Q6_K   896
 
+// F16 tile (32 rows x 32 k) in HMX layout: vector cp holds k = 2*cp and 2*cp+1 of all 32 rows,
+//   element (row, k) is fp16 number cp*64 + row*2 + (k & 1). HMX reads it as is.
+#define HTP_MM_WEIGHT_TILE_SIZE_F16    2048
+
+// F32 tile (32 rows x 32 k): vector k holds k of all 32 rows, element (row, k) is float number k*32 + row.
+#define HTP_MM_WEIGHT_TILE_SIZE_F32    4096
+
 // --- Weight Repacked Aligned Tile Sizes ---
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0   640
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_1   640
@@ -42,6 +49,8 @@ extern "C" {
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_MXFP4  640
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q5_K   768
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q6_K   896
+#define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_F16    2048
+#define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_F32    4096
 
 // --- Activation Tiled Block Sizes (including padding) ---
 #define HTP_MM_ACT_TILE_SIZE_Q8_0      1152
@@ -209,6 +218,10 @@ static inline uint32_t htp_mm_get_weight_tile_size(int weight_type) {
             return HTP_MM_WEIGHT_TILE_SIZE_Q6_K;
         case HTP_TYPE_MXFP4:
             return HTP_MM_WEIGHT_TILE_SIZE_MXFP4;
+        case HTP_TYPE_F16_TILED:
+            return HTP_MM_WEIGHT_TILE_SIZE_F16;
+        case HTP_TYPE_F32_TILED:
+            return HTP_MM_WEIGHT_TILE_SIZE_F32;
         default:
             return 0;
     }
@@ -230,6 +243,10 @@ static inline uint32_t htp_mm_get_weight_aligned_tile_size(int weight_type) {
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q6_K;
         case HTP_TYPE_MXFP4:
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_MXFP4;
+        case HTP_TYPE_F16_TILED:
+            return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_F16;
+        case HTP_TYPE_F32_TILED:
+            return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_F32;
         default:
             return 0;
     }
@@ -238,6 +255,11 @@ static inline uint32_t htp_mm_get_weight_aligned_tile_size(int weight_type) {
 // weight types whose tiles carry a per-block offset (x = d * q + m): the activations need block sums (q8_1)
 static inline bool htp_mm_weight_has_offset(int weight_type) {
     return weight_type == HTP_TYPE_Q4_1 || weight_type == HTP_TYPE_Q4_K || weight_type == HTP_TYPE_Q5_K;
+}
+
+// Weight types stored in 32x32 tiles: the repacked quantized types and the repacked F16/F32 weights.
+static inline bool htp_mm_is_tiled_type(int weight_type) {
+    return htp_mm_get_weight_tile_size(weight_type) != 0;
 }
 
 // --- Activation/Row Size Helpers ---
@@ -253,6 +275,19 @@ static inline size_t htp_mm_q8_1_tiled_row_size(uint32_t ne) {
     return nb_32 * HTP_MM_ACT_TILE_SIZE_Q8_1;
 }
 
+// Row size of the activations prepared for the HVX tiled kernels of this weight type.
+// Quantized weights take q8 tiled activations, repacked F16/F32 weights splatted fp16 pairs / fp32 values.
+static inline size_t htp_mm_get_tiled_act_row_size(int weight_type, uint32_t ne) {
+    switch (weight_type) {
+        case HTP_TYPE_F16_TILED:
+            return (size_t) (ne / 2) * 128; // one vector per fp16 pair
+        case HTP_TYPE_F32_TILED:
+            return (size_t) ne * 128; // one vector per fp32 value
+        default:
+            return htp_mm_weight_has_offset(weight_type) ? htp_mm_q8_1_tiled_row_size(ne) : htp_mm_q8_0_tiled_row_size(ne);
+    }
+}
+
 static inline size_t htp_mm_get_tiled_row_stride(int weight_type, uint32_t k) {
     uint32_t nb = (k + QK_Q4_0_TILED - 1) / QK_Q4_0_TILED;
     switch (weight_type) {
@@ -265,6 +300,10 @@ static inline size_t htp_mm_get_tiled_row_stride(int weight_type, uint32_t k) {
         case HTP_TYPE_Q6_K:
         case HTP_TYPE_MXFP4:
             return (size_t) nb * htp_mm_get_weight_tile_size(weight_type);
+        case HTP_TYPE_F16_TILED:
+            return (size_t) k * sizeof(__fp16);
+        case HTP_TYPE_F32_TILED:
+            return (size_t) k * sizeof(float);
         case HTP_TYPE_F16:
             return (size_t) k * sizeof(__fp16);
         case HTP_TYPE_F32:
@@ -498,10 +537,7 @@ static inline void htp_mm_hvx_vtcm_layout_build(
     size_t dst_sz     = 0;
     size_t act_raw_sz = 0;
 
-    const bool is_repack = (wtype == HTP_TYPE_Q4_0 || wtype == HTP_TYPE_Q4_1 ||
-                            wtype == HTP_TYPE_Q8_0 || wtype == HTP_TYPE_IQ4_NL ||
-                            wtype == HTP_TYPE_MXFP4 || wtype == HTP_TYPE_Q6_K ||
-                            wtype == HTP_TYPE_Q4_K || wtype == HTP_TYPE_Q5_K);
+    const bool is_repack = htp_mm_is_tiled_type(wtype);
 
     if (is_fused_nx) {
         const size_t src0_row_size_padded = hex_round_up(src0_row_size, 128);
@@ -518,7 +554,7 @@ static inline void htp_mm_hvx_vtcm_layout_build(
             weight_sz_per_thread = hex_round_up(n_prefetch * src0_row_size_padded, 128);
         }
 
-        size_t tiled_act_row_size = htp_mm_weight_has_offset(wtype) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
+        size_t tiled_act_row_size = htp_mm_get_tiled_act_row_size(wtype, ne10);
         size_t act_sz = hex_round_up(tiled_act_row_size * src1_nrows, 128);
         size_t raw_row_size = hex_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
 
@@ -530,8 +566,7 @@ static inline void htp_mm_hvx_vtcm_layout_build(
         act_raw_sz = hex_round_up(raw_row_size * src1_nrows, 128);
     } else if (is_matmul_id) {
         const size_t src0_row_size_padded = htp_mm_round_up(src0_row_size, 128);
-        const size_t src1_row_size_tiled = htp_mm_weight_has_offset(wtype) ? htp_mm_q8_1_tiled_row_size(ne10)
-                                                                                               : htp_mm_q8_0_tiled_row_size(ne10);
+        const size_t src1_row_size_tiled = htp_mm_get_tiled_act_row_size(wtype, ne10);
 
         size_t src0_sz_per_thread = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256);
         src1_sz                   = htp_mm_round_up(src1_row_size_tiled * src1_nrows, 256);
@@ -574,7 +609,7 @@ static inline void htp_mm_hvx_vtcm_layout_build(
             }
             case HTP_MM_KERNEL_HVX_QUANT_BLOCK:
             case HTP_MM_KERNEL_HVX_QUANT_ROW: {
-                size_t q_src1_row_size = htp_mm_weight_has_offset(wtype) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
+                size_t q_src1_row_size = htp_mm_get_tiled_act_row_size(wtype, ne10);
 
                 src0_sz = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256);
                 src1_sz = htp_mm_round_up(q_src1_row_size * src1_nrows, 256);
@@ -661,9 +696,7 @@ static inline bool htp_mm_hvx_solve_vtcm_params(
     const size_t avail_act = vtcm_budget - fixed_bytes;
     size_t row_size = 0;
     if (kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW || kernel_type == HTP_MM_KERNEL_HVX_QUANT_BLOCK) {
-        row_size = htp_mm_weight_has_offset(wtype)
-                 ? htp_mm_q8_1_tiled_row_size(ne10)
-                 : htp_mm_q8_0_tiled_row_size(ne10);
+        row_size = htp_mm_get_tiled_act_row_size(wtype, ne10);
     } else if (kernel_type == HTP_MM_KERNEL_HVX_F16_F16_VTCM) {
         row_size = hex_round_up(ne10 * 2, 128);
     } else {

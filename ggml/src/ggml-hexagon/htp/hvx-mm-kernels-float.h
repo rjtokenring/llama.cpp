@@ -66,6 +66,81 @@ static inline void quantize_f16_f16_kernel(
     }
 }
 
+// Activations for the F16 tile kernels (see tiled_vec_dot_f16_32x1): each fp16 pair k = 2i, 2i+1 fills a whole
+// vector, so the dot kernel reads it with a vector load. The source rows are already in VTCM (vtcm_act_raw).
+static inline void hvx_splat_f16_pairs(uint8_t * restrict dst, const uint8_t * restrict src_f16, uint32_t ne0) {
+    const uint32_t * restrict p = (const uint32_t *) src_f16;
+    HVX_Vector * restrict d = (HVX_Vector *) dst;
+    for (uint32_t i = 0; i < ne0 / 2; i++) {
+        d[i] = Q6_V_vsplat_R(p[i]);
+    }
+}
+
+static inline void quantize_f32_f16_pairs_kernel(
+    const uint8_t * restrict src_data,
+    uint8_t * restrict dst_data,
+    uint8_t * restrict tmp_data,
+    uint32_t ne0,
+    uint32_t nrows,
+    size_t src_stride,
+    size_t dst_stride
+) {
+    (void) tmp_data;
+    // fp16 staging for 64 values: one vector, converted and splatted chunk by chunk
+    __fp16 buf[64] __attribute__((aligned(128)));
+    for (uint32_t i = 0; i < nrows; ++i) {
+        for (uint32_t k = 0; k < ne0; k += 64) {
+            const uint32_t n = MIN(64, ne0 - k);
+            hvx_copy_f16_f32_au((uint8_t *) buf, src_data + k * sizeof(float), n);
+            hvx_splat_f16_pairs(dst_data + (k / 2) * 128, (const uint8_t *) buf, n);
+        }
+
+        dst_data += dst_stride;
+        src_data += src_stride;
+    }
+}
+
+static inline void quantize_f16_f16_pairs_kernel(
+    const uint8_t * restrict src_data,
+    uint8_t * restrict dst_data,
+    uint8_t * restrict tmp_data,
+    uint32_t ne0,
+    uint32_t nrows,
+    size_t src_stride,
+    size_t dst_stride
+) {
+    (void) tmp_data;
+    for (uint32_t i = 0; i < nrows; ++i) {
+        hvx_splat_f16_pairs(dst_data, src_data, ne0);
+
+        dst_data += dst_stride;
+        src_data += src_stride;
+    }
+}
+
+// Activations for the F32 tile kernels (see tiled_vec_dot_f32_32x1): each fp32 value fills a whole vector.
+static inline void quantize_f32_f32_splat_kernel(
+    const uint8_t * restrict src_data,
+    uint8_t * restrict dst_data,
+    uint8_t * restrict tmp_data,
+    uint32_t ne0,
+    uint32_t nrows,
+    size_t src_stride,
+    size_t dst_stride
+) {
+    (void) tmp_data;
+    for (uint32_t i = 0; i < nrows; ++i) {
+        const uint32_t * restrict p = (const uint32_t *) src_data;
+        HVX_Vector * restrict d = (HVX_Vector *) dst_data;
+        for (uint32_t k = 0; k < ne0; k++) {
+            d[k] = Q6_V_vsplat_R(p[k]);
+        }
+
+        dst_data += dst_stride;
+        src_data += src_stride;
+    }
+}
+
 // Float dot product kernels (HVX)
 
 #if __HVX_ARCH__ < 79
