@@ -25,6 +25,9 @@ extern "C" {
 #define HTP_MM_WEIGHT_TILE_SIZE_Q8_0   1088
 #define HTP_MM_WEIGHT_TILE_SIZE_IQ4_NL 576
 #define HTP_MM_WEIGHT_TILE_SIZE_MXFP4  544
+// Q5_K: the Q4_1 tile (640) followed by a 128-byte plane with the 5th bit of every quant, transposed so that
+//   plane byte l holds the eight flags of lane l: bit 2i = low nibble of nibble vector i, bit 2i+1 = high nibble
+#define HTP_MM_WEIGHT_TILE_SIZE_Q5_K   768
 // Q6_K native 6-bit tile (32 rows x 32 k), vrmpy-ready: byte 4*row+b of a vector holds k = 4*group+b
 //   vectors 0..3: low nibbles, vector i holds group 2i (low nibble) and group 2i+1 (high nibble)
 //   vectors 4..5: high 2 bits, vector m holds groups 4m..4m+3 at bit offsets 0,2,4,6
@@ -44,6 +47,7 @@ extern "C" {
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q8_0   1152
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_IQ4_NL 640
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_MXFP4  640
+#define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q5_K   768
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q6_K   896
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_F16    2048
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_F32    4096
@@ -208,6 +212,8 @@ static inline uint32_t htp_mm_get_weight_tile_size(int weight_type) {
             return HTP_MM_WEIGHT_TILE_SIZE_Q4_1;
         case HTP_TYPE_Q8_0:
             return HTP_MM_WEIGHT_TILE_SIZE_Q8_0;
+        case HTP_TYPE_Q5_K:
+            return HTP_MM_WEIGHT_TILE_SIZE_Q5_K;
         case HTP_TYPE_Q6_K:
             return HTP_MM_WEIGHT_TILE_SIZE_Q6_K;
         case HTP_TYPE_MXFP4:
@@ -231,6 +237,8 @@ static inline uint32_t htp_mm_get_weight_aligned_tile_size(int weight_type) {
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_1;
         case HTP_TYPE_Q8_0:
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q8_0;
+        case HTP_TYPE_Q5_K:
+            return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q5_K;
         case HTP_TYPE_Q6_K:
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q6_K;
         case HTP_TYPE_MXFP4:
@@ -242,6 +250,11 @@ static inline uint32_t htp_mm_get_weight_aligned_tile_size(int weight_type) {
         default:
             return 0;
     }
+}
+
+// weight types whose tiles carry a per-block offset (x = d * q + m): the activations need block sums (q8_1)
+static inline bool htp_mm_weight_has_offset(int weight_type) {
+    return weight_type == HTP_TYPE_Q4_1 || weight_type == HTP_TYPE_Q4_K || weight_type == HTP_TYPE_Q5_K;
 }
 
 // Weight types stored in 32x32 tiles: the repacked quantized types and the repacked F16/F32 weights.
@@ -270,11 +283,8 @@ static inline size_t htp_mm_get_tiled_act_row_size(int weight_type, uint32_t ne)
             return (size_t) (ne / 2) * 128; // one vector per fp16 pair
         case HTP_TYPE_F32_TILED:
             return (size_t) ne * 128; // one vector per fp32 value
-        case HTP_TYPE_Q4_1:
-        case HTP_TYPE_Q4_K:
-            return htp_mm_q8_1_tiled_row_size(ne);
         default:
-            return htp_mm_q8_0_tiled_row_size(ne);
+            return htp_mm_weight_has_offset(weight_type) ? htp_mm_q8_1_tiled_row_size(ne) : htp_mm_q8_0_tiled_row_size(ne);
     }
 }
 
@@ -286,6 +296,7 @@ static inline size_t htp_mm_get_tiled_row_stride(int weight_type, uint32_t k) {
         case HTP_TYPE_Q4_1:
         case HTP_TYPE_Q4_K:
         case HTP_TYPE_Q8_0:
+        case HTP_TYPE_Q5_K:
         case HTP_TYPE_Q6_K:
         case HTP_TYPE_MXFP4:
             return (size_t) nb * htp_mm_get_weight_tile_size(weight_type);
@@ -374,6 +385,7 @@ struct htp_mm_hvx_vtcm_layout {
     size_t off_src2;          // vtcm_src2 (Wq / fused only)
     size_t off_src3;          // vtcm_src3 (Wv / fused only)
     size_t off_dst;           // vtcm_dst (output scratch)
+    size_t off_act_raw;       // vtcm_act_raw (raw activation DMA staging)
 
     // Cached sizes
     size_t src0_bytes;
@@ -381,6 +393,7 @@ struct htp_mm_hvx_vtcm_layout {
     size_t src2_bytes;
     size_t src3_bytes;
     size_t dst_bytes;
+    size_t act_raw_bytes;
 
     size_t total_bytes;
 };
@@ -393,7 +406,6 @@ static inline void htp_mm_hmx_vtcm_layout_build(
     size_t mc,
     size_t nc,
     uint32_t group_size,
-    bool use_dma_activation,
     bool pipeline,
     uint32_t act_threads,
     uint32_t aligned_tile_size,
@@ -408,8 +420,7 @@ static inline void htp_mm_hmx_vtcm_layout_build(
         const size_t activation_area_size = hex_align_up(group_size * act_head_stride * sizeof(uint16_t), HTP_MM_HMX_TILE_SIZE);
         const size_t output_area_size  = hex_align_up(group_size * mc * nc * sizeof(uint16_t), HTP_MM_HMX_TILE_SIZE);
         const size_t scratch_area_size = hex_align_up(nc * vec_dot_size, HTP_MM_HMX_TILE_SIZE);
-        const size_t min_f32_size = use_dma_activation
-            ? hex_align_up(act_threads * HTP_MM_DMA_ACT_MULTIPLIER * k * sizeof(float), 128) : 0;
+        const size_t min_f32_size = hex_align_up(act_threads * HTP_MM_DMA_ACT_MULTIPLIER * k * sizeof(float), 128);
 
         // Group A: Permanent activation tiles and scales
         size_t off_group_a = 0;
@@ -430,10 +441,9 @@ static inline void htp_mm_hmx_vtcm_layout_build(
 
         // Group C: Activation prep temporary buffer (overlaps Group B, starting at off_group_a)
         const size_t max_f32_size = act_threads * 64 * k * sizeof(float);
-        const size_t act_f32_size = use_dma_activation
-            ? hex_align_up(hex_smin(max_f32_size, hex_smax(min_f32_size, group_b_size)), 128) : 0;
+        const size_t act_f32_size = hex_align_up(hex_smin(max_f32_size, hex_smax(min_f32_size, group_b_size)), 128);
         size_t off_group_c = off_group_a;
-        VTCM_LAYOUT_ALLOC_OPTIONAL(off_group_c, off_act_f32, act_f32_size, use_dma_activation);
+        VTCM_LAYOUT_ALLOC(off_group_c, off_act_f32, act_f32_size);
 
         const size_t group_c_size = off_group_c - off_group_a;
 
@@ -520,17 +530,17 @@ static inline void htp_mm_hvx_vtcm_layout_build(
     bool is_fused_nx
 ) {
     (void)src1_row_size;
-    size_t src0_sz = 0;
-    size_t src1_sz = 0;
-    size_t src2_sz = src2_row_size > 0 ? htp_mm_round_up(src2_row_size, 128) : 0;
-    size_t src3_sz = 0;
-    size_t dst_sz  = 0;
+    size_t src0_sz    = 0;
+    size_t src1_sz    = 0;
+    size_t src2_sz    = src2_row_size > 0 ? htp_mm_round_up(src2_row_size, 128) : 0;
+    size_t src3_sz    = 0;
+    size_t dst_sz     = 0;
+    size_t act_raw_sz = 0;
 
     const bool is_repack = htp_mm_is_tiled_type(wtype);
 
     if (is_fused_nx) {
         const size_t src0_row_size_padded = hex_round_up(src0_row_size, 128);
-        const size_t quant_scratch_size = hex_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float)) * n_threads;
 
         size_t weight_sz_per_thread = 0;
 
@@ -546,12 +556,14 @@ static inline void htp_mm_hvx_vtcm_layout_build(
 
         size_t tiled_act_row_size = htp_mm_get_tiled_act_row_size(wtype, ne10);
         size_t act_sz = hex_round_up(tiled_act_row_size * src1_nrows, 128);
+        size_t raw_row_size = hex_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
 
-        src0_sz = weight_sz_per_thread * n_threads; // shared single-weight prefetch buffer
-        src1_sz = act_sz;                           // quantized activation buffer
-        src2_sz = 0;
-        src3_sz = 0;
-        dst_sz  = quant_scratch_size;
+        src0_sz    = weight_sz_per_thread * n_threads; // shared single-weight prefetch buffer
+        src1_sz    = act_sz;                           // quantized activation buffer
+        src2_sz    = 0;
+        src3_sz    = 0;
+        dst_sz     = 0;
+        act_raw_sz = hex_round_up(raw_row_size * src1_nrows, 128);
     } else if (is_matmul_id) {
         const size_t src0_row_size_padded = htp_mm_round_up(src0_row_size, 128);
         const size_t src1_row_size_tiled = htp_mm_get_tiled_act_row_size(wtype, ne10);
@@ -567,10 +579,13 @@ static inline void htp_mm_hvx_vtcm_layout_build(
             src0_sz_per_thread               = repacked_vtcm_size;
         }
 
-        src0_sz = src0_sz_per_thread * n_threads;
-        dst_sz  = htp_mm_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float)) * n_threads;
-        src2_sz = 0;
-        src3_sz = 0;
+        size_t raw_row_size = hex_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
+
+        src0_sz    = src0_sz_per_thread * n_threads;
+        dst_sz     = 0;
+        src2_sz    = 0;
+        src3_sz    = 0;
+        act_raw_sz = hex_round_up(raw_row_size * src1_nrows, 128);
     } else {
         const size_t src0_row_size_padded = htp_mm_round_up(src0_row_size, 128);
         const size_t dst_nrows = (src1_nrows > 1) ? 0 : 1;
@@ -578,16 +593,18 @@ static inline void htp_mm_hvx_vtcm_layout_build(
         switch (kernel_type) {
             case HTP_MM_KERNEL_HVX_F16_F16_VTCM: {
                 size_t f16_src1_row_size = htp_mm_round_up(ne10 * 2, 128);
-                src1_sz = htp_mm_round_up(f16_src1_row_size * src1_nrows, 256);
-                src0_sz = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256) * n_threads;
-                dst_sz  = dst_nrows > 0 ? htp_mm_round_up(dst_row_size, 128) * n_threads : 0;
+                src1_sz    = htp_mm_round_up(f16_src1_row_size * src1_nrows, 256);
+                src0_sz    = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256) * n_threads;
+                dst_sz     = dst_nrows > 0 ? htp_mm_round_up(dst_row_size, 128) * n_threads : 0;
+                act_raw_sz = hex_round_up(hex_round_up(ne10 * sizeof(float), 128) * src1_nrows, 128);
                 break;
             }
             case HTP_MM_KERNEL_HVX_F32_F32_VTCM: {
                 size_t f32_src1_row_size = htp_mm_round_up(ne10 * 4, 128);
-                src1_sz = htp_mm_round_up(f32_src1_row_size * src1_nrows, 256);
-                src0_sz = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256) * n_threads;
-                dst_sz  = dst_nrows > 0 ? htp_mm_round_up(dst_row_size, 128) * n_threads : 0;
+                src1_sz    = htp_mm_round_up(f32_src1_row_size * src1_nrows, 256);
+                src0_sz    = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256) * n_threads;
+                dst_sz     = dst_nrows > 0 ? htp_mm_round_up(dst_row_size, 128) * n_threads : 0;
+                act_raw_sz = 0;
                 break;
             }
             case HTP_MM_KERNEL_HVX_QUANT_BLOCK:
@@ -607,10 +624,10 @@ static inline void htp_mm_hvx_vtcm_layout_build(
                     src0_sz = repacked_vtcm_size * n_threads;
                 }
 
-                size_t quant_scratch_size_per_thread = htp_mm_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
                 size_t dst_slice_per_thread = (dst_nrows > 0 && src1_nrows == 1) ? htp_mm_round_up((dst_row_size + n_threads - 1) / n_threads, 128) : 0;
-                size_t dst_size_per_thread = (dst_slice_per_thread > quant_scratch_size_per_thread) ? dst_slice_per_thread : quant_scratch_size_per_thread;
-                dst_sz = dst_size_per_thread * n_threads;
+                dst_sz = dst_slice_per_thread * n_threads;
+                size_t raw_row_size = hex_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
+                act_raw_sz = hex_round_up(raw_row_size * src1_nrows, 128);
                 break;
             }
             default:
@@ -618,19 +635,30 @@ static inline void htp_mm_hvx_vtcm_layout_build(
         }
     }
 
-    size_t off = 0;
-    VTCM_LAYOUT_ALLOC(off, off_src0, src0_sz);
-    VTCM_LAYOUT_ALLOC(off, off_src1, src1_sz);
-    VTCM_LAYOUT_ALLOC(off, off_src2, src2_sz);
-    VTCM_LAYOUT_ALLOC(off, off_src3, src3_sz);
-    VTCM_LAYOUT_ALLOC(off, off_dst,  dst_sz);
+    // Group A: Persistent buffers across chunk compute
+    size_t off_group_a = 0;
+    VTCM_LAYOUT_ALLOC(off_group_a, off_src1, src1_sz);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off_group_a, off_src2, src2_sz, src2_sz > 0);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off_group_a, off_src3, src3_sz, src3_sz > 0);
 
-    L->src0_bytes = src0_sz;
-    L->src1_bytes = src1_sz;
-    L->src2_bytes = src2_sz;
-    L->src3_bytes = src3_sz;
-    L->dst_bytes  = dst_sz;
-    L->total_bytes = off;
+    // Group B: Compute-only buffers (starts at off_group_a)
+    size_t off_group_b = off_group_a;
+    VTCM_LAYOUT_ALLOC(off_group_b, off_src0, src0_sz);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off_group_b, off_dst, dst_sz, dst_sz > 0);
+    const size_t group_b_size = off_group_b - off_group_a;
+
+    // Group C: Raw activation staging buffer (overlaps Group B, starts at off_group_a)
+    size_t off_group_c = off_group_a;
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off_group_c, off_act_raw, act_raw_sz, act_raw_sz > 0);
+    const size_t group_c_size = off_group_c - off_group_a;
+
+    L->src0_bytes    = src0_sz;
+    L->src1_bytes    = src1_sz;
+    L->src2_bytes    = src2_sz;
+    L->src3_bytes    = src3_sz;
+    L->dst_bytes     = dst_sz;
+    L->act_raw_bytes = act_raw_sz;
+    L->total_bytes   = off_group_a + hex_smax(group_b_size, group_c_size);
 }
 
 static inline bool htp_mm_hvx_solve_vtcm_params(
@@ -678,7 +706,12 @@ static inline bool htp_mm_hvx_solve_vtcm_params(
         return false;
     }
 
-    uint32_t m_chunk = (uint32_t) (avail_act / row_size);
+    size_t eff_row_size = row_size;
+    if (kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW || kernel_type == HTP_MM_KERNEL_HVX_QUANT_BLOCK) {
+        eff_row_size += hex_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
+    }
+
+    uint32_t m_chunk = (uint32_t) (avail_act / eff_row_size);
     if (m_chunk > 1) {
         m_chunk &= ~1U;
     }
@@ -715,15 +748,15 @@ static inline size_t htp_mm_hmx_get_2d_vtcm_size(
     int wtype, uint32_t k, size_t mc, size_t nc, bool pipeline, uint32_t act_threads, uint32_t aligned_tile_size, size_t src2_size
 ) {
     struct htp_mm_hmx_vtcm_layout L;
-    htp_mm_hmx_vtcm_layout_build(&L, HTP_MM_KERNEL_HMX_2D, wtype, k, mc, nc, 1, false, pipeline, act_threads, aligned_tile_size, src2_size);
+    htp_mm_hmx_vtcm_layout_build(&L, HTP_MM_KERNEL_HMX_2D, wtype, k, mc, nc, 1, pipeline, act_threads, aligned_tile_size, src2_size);
     return L.total_bytes;
 }
 
 static inline size_t htp_mm_hmx_get_batched_vtcm_size(
-    int wtype, uint32_t k, size_t mc, size_t nc, uint32_t group_size, bool use_dma_activation, bool pipeline, uint32_t act_threads, size_t src2_size) {
+    int wtype, uint32_t k, size_t mc, size_t nc, uint32_t group_size, bool pipeline, uint32_t act_threads, size_t src2_size) {
     (void)pipeline;
     struct htp_mm_hmx_vtcm_layout L;
-    htp_mm_hmx_vtcm_layout_build(&L, HTP_MM_KERNEL_HMX_F16_BATCHED, wtype, k, mc, nc, group_size, use_dma_activation, false, act_threads, 0, src2_size);
+    htp_mm_hmx_vtcm_layout_build(&L, HTP_MM_KERNEL_HMX_F16_BATCHED, wtype, k, mc, nc, group_size, false, act_threads, 0, src2_size);
     return L.total_bytes;
 }
 
@@ -733,7 +766,6 @@ static inline bool htp_mm_hmx_solve_batched_params(
     uint32_t ne01_padded,
     uint32_t ne11,
     uint32_t group_size,
-    bool use_dma_activation,
     int n_threads,
     bool pipeline,
     size_t src2_size,
@@ -762,7 +794,7 @@ static inline bool htp_mm_hmx_solve_batched_params(
         if (htp_mm_hmx_compute_chunks(vtcm_budget, group_overhead, group_size_per_n, group_size_per_m, group_size_per_mn, hex_align_up(ne11, 32), ne01_padded,
                                (size_t) ne01_padded * HTP_MM_HMX_COST_W_DEQUANT, (size_t) ne11 * HTP_MM_HMX_COST_A_CONVERT,
                                &m_chunk_candidate, &n_chunk_candidate, &vtcm_size_candidate) == 0) {
-            size_t exact_size = htp_mm_hmx_get_batched_vtcm_size(wtype, k, m_chunk_candidate, n_chunk_candidate, group_size, use_dma_activation, pipeline, act_threads, src2_size);
+            size_t exact_size = htp_mm_hmx_get_batched_vtcm_size(wtype, k, m_chunk_candidate, n_chunk_candidate, group_size, pipeline, act_threads, src2_size);
             if (exact_size <= vtcm_budget) {
                 size_t mblocks = ((size_t) ne11 + m_chunk_candidate - 1) / m_chunk_candidate;
                 if (mblocks < best_mblocks || (mblocks == best_mblocks && act_threads > best_act_threads)) {
