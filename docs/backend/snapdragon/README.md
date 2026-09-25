@@ -222,8 +222,8 @@ constraints, and single- or multi-NPU hardware topologies:
 
 Runs the model on a single NPU session (e.g. `HTP0` or `HTP0:0`).
 
-A single NPU session provides ~3.5GB of available virtual address space. For models larger than 3.5GB, the backend
-automatically maps and unmaps weight buffers during graph execution. This allows large models to run on a single NPU
+A single NPU session provides ~3.1GB of available virtual address space (3200MB minus the op-queue shared memory).
+For models larger than that, the backend automatically maps and unmaps weight buffers during graph execution. This allows large models to run on a single NPU
 without manual configuration:
 
 ```bash
@@ -236,8 +236,30 @@ without manual configuration:
 Partitions model layers at load time across multiple virtual sessions hosted on a single physical NPU.
 
 Each virtual session acts as an independent backend device from llama.cpp's perspective (similar to multiple GPUs).
-Because layers are permanently distributed across sessions, each session's allocated weights remain within its private 3.5GB
+Because layers are permanently distributed across sessions, each session's allocated weights remain within its private ~3.1GB
 address space window, eliminating runtime buffer re-mapping overhead.
+
+#### Automatic device selection (`--device auto`)
+
+`--device auto` picks the smallest number of sessions on which the model fits. It loads the model without allocating
+memory (the same probe used by `--fit`) on `HTP0`, then `HTP0,HTP1`, and so on, and stops at the first prefix where
+every session has at least `--fit-target` MiB left after weights, KV cache and compute buffers. Only the sessions that
+are used are opened. Layers are split equally between the chosen sessions, exactly like an explicit `--device HTP0,HTP1`.
+
+By default the backend exposes 4 virtual sessions on NPU 0, so no `GGML_HEXAGON_DEVICES` setting is needed:
+
+```bash
+./scripts/snapdragon/run.py --target adb --devices auto -- \
+    llama-server -m models/Qwen3.5-4B-Q4_0.gguf -c 16384 -np 4 -fit off -fitt 512
+```
+
+Notes:
+- The default `--fit-target` margin is 1024 MiB per device, which is large for a ~3.1GB window. Use `-fitt` to tune it
+  (e.g. 512 MiB). The margin only covers estimation error: a single buffer larger than what FastRPC can map still fails.
+- `-fit off` is recommended together with `--device auto`. `--fit` would rather move layers to the CPU than add a session.
+- If the model does not fit on any number of sessions, or a session cannot be opened (e.g. the system-wide FastRPC
+  session limit was reached by other processes), the load fails with an error instead of guessing.
+- With `llama-server` in router mode, pass `--device auto` once to the router: it is inherited by every model process.
 
 Here is an example of running the GPT-OSS-20B model on a Snapdragon device using 4 virtual sessions on a single NPU:
 
@@ -306,8 +328,11 @@ on 4 physical NPUs, or `--devices 'HTP0[0-1:0],HTP1[0-1:1]'` on 2 physical NPUs 
 
 ## Environment variables
 
-- `GGML_HEXAGON_DEVICES` (default: not set, defaults to HTP0 session)
-  Controls which NPU devices and sessions to allocate. Configurable via `--devices` in `run.py`:
+- `GGML_HEXAGON_DEVICES` (default: not set, same as `auto`)
+  Controls which NPU devices and sessions to expose. Sessions are opened only when a model uses the device.
+  Configurable via `--devices` in `run.py`:
+  - `auto` (or not set): Exposes 4 virtual sessions `HTP0`..`HTP3` on physical NPU 0. Use `--device` to pick the ones
+    to run on (`--device auto` picks the fewest that fit the model). Without `--device`, llama.cpp uses all of them.
   - `N` (single integer): Allocates `N` virtual sessions named `HTP0`, `HTP1`, ..., `HTP<N-1>` on physical NPU 0.
   - `HTP<phys>:<virt>,...`: Comma-separated list of individual devices specifying physical and virtual index:
     - `HTP0:0,HTP0:1`: Two virtual sessions on physical NPU 0 (layer-split on single NPU).

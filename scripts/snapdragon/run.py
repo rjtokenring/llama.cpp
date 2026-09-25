@@ -254,6 +254,10 @@ def main():
     if devices_val.isdigit():
         hex_devices = devices_val
         cl_device = ""
+    elif devices_val == "auto":
+        # llama.cpp picks the sessions itself, the backend exposes its default maximum
+        hex_devices = ""
+        cl_device = ""
     else:
         parts = split_device_list(devices_val)
         # Any device containing "htp" is Hexagon, rest is OpenCL

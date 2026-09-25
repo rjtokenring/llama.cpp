@@ -1315,6 +1315,32 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    if (params.devices_auto && params.devices.empty()) {
+        const int64_t t0_us = llama_time_us();
+        try {
+            params.devices = common_fit_devices(params.model.path.c_str(), &mparams, &cparams,
+                params.fit_params_target.data(),
+                params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        } catch (const std::runtime_error & e) {
+            COM_WRN("automatic device selection failed: %s\n", e.what());
+            return;
+        }
+        if (!params.devices.empty()) {
+            std::string names;
+            for (auto dev : params.devices) {
+                names += names.empty() ? "" : ",";
+                names += ggml_backend_dev_name(dev);
+            }
+            COM_INF("automatic device selection: using %zu device(s) %s (%.2f s)\n",
+                params.devices.size(), names.c_str(), (llama_time_us() - t0_us) * 1e-6);
+            if (params.mmproj_use_gpu && params.mmproj_device == nullptr) {
+                params.mmproj_device = params.devices.front();
+            }
+            params.devices.push_back(nullptr);
+            mparams.devices = params.devices.data(); // mparams was built while the list was still empty
+        }
+    }
+
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");

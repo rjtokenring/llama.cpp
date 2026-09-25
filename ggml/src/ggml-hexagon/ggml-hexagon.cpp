@@ -71,6 +71,7 @@ using uintvec = std::vector<unsigned int>;
 using u32vec  = std::vector<uint32_t>;
 
 #define GGML_HEXAGON_MAX_SESSIONS          16
+#define GGML_HEXAGON_MAX_VSESSIONS         4  // virtual sessions per process, FastRPC rejects the 5th reservation
 
 #define GGML_HEXAGON_FENCE_SLOT_SIZE       128
 
@@ -3353,6 +3354,24 @@ struct ggml_hexagon_registry {
     ggml_backend_device devices[GGML_HEXAGON_MAX_SESSIONS];
 };
 
+// size of the shared memory block that holds `depth` op batches of `n_ops` ops
+static size_t ggml_hexagon_opqueue_shm_size(size_t n_ops, size_t depth) {
+    size_t n_tensors = n_ops * HTP_OP_MAX_OUTPUTS + n_ops * HTP_OP_MAX_INPUTS;
+
+    size_t tr_size = 0;
+    if (opt_profile == 3) {
+        tr_size = (HTP_MAX_NTHREADS + 1) * opt_optrace * sizeof(htp_trace_desc);
+    }
+
+    size_t blk_size = sizeof(htp_buf_desc)  * HTP_OP_MAX_BUFS +
+                      sizeof(htp_tensor)    * n_tensors       +
+                      sizeof(htp_op_desc)   * n_ops           +
+                      sizeof(htp_prof_desc) * n_ops           +
+                      tr_size;
+
+    return blk_size * depth;
+}
+
 struct ggml_hexagon_opqueue {
     // Shared buffer for storing batches
     ggml_hexagon_shared_buffer *shm_buf;
@@ -3365,20 +3384,7 @@ struct ggml_hexagon_opqueue {
     std::vector<uint64_t>       start_usec;     // per batch start time
 
     ggml_hexagon_opqueue(ggml_hexagon_session *sess, size_t batch_size, size_t depth) : depth(depth) {
-        size_t n_bufs    = HTP_OP_MAX_BUFS;
-        size_t n_ops     = batch_size;
-        size_t n_tensors = n_ops * HTP_OP_MAX_OUTPUTS + n_ops * HTP_OP_MAX_INPUTS;
-
-        size_t tr_size = 0;
-        if (opt_profile == 3) {
-            tr_size = (HTP_MAX_NTHREADS + 1) * opt_optrace * sizeof(htp_trace_desc);
-        }
-
-        shm_blk_size = sizeof(htp_buf_desc)  * n_bufs    +
-                       sizeof(htp_tensor)    * n_tensors +
-                       sizeof(htp_op_desc)   * n_ops     +
-                       sizeof(htp_prof_desc) * n_ops     +
-                       tr_size;
+        shm_blk_size = ggml_hexagon_opqueue_shm_size(batch_size, 1);
 
         shm_buf = new ggml_hexagon_shared_buffer(sess, shm_blk_size * depth, true /* pinned */);
 
@@ -7258,10 +7264,17 @@ static const char * ggml_backend_hexagon_device_get_description(ggml_backend_dev
 }
 
 static void ggml_backend_hexagon_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
-    *free  = 0;
-    *total = *free;
+    auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
 
-    GGML_UNUSED(dev);
+    // report the VA window of the session, do not open a session for this
+    size_t vmem = dev_ctx->sess ? dev_ctx->sess->max_vmem : 0;
+    if (!vmem && opt_vmem) {
+        const size_t shm = ggml_hexagon_opqueue_shm_size(opt_opbatch, opt_opqueue);
+        vmem = opt_vmem > shm ? opt_vmem - shm : opt_vmem;
+    }
+
+    *free  = vmem;
+    *total = vmem;
 }
 
 static enum ggml_backend_dev_type ggml_backend_hexagon_device_get_type(ggml_backend_dev_t dev) {
@@ -8055,7 +8068,20 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
         str_devices = str_ndev;
     }
 
-    if (str_devices && str_devices[0] != '\0') {
+    // n virtual sessions HTP0..HTP(n-1) on physical NPU 0
+    auto set_virtual_devices = [](int n) {
+        if (n < 1) n = 1;
+        if (n > GGML_HEXAGON_MAX_SESSIONS) n = GGML_HEXAGON_MAX_SESSIONS;
+        opt_ndev = n;
+        for (size_t i = 0; i < opt_ndev; i++) {
+            opt_device_configs[i].physical_idx = 0;
+            opt_device_configs[i].virtual_idx  = (int)i;
+            opt_device_configs[i].name         = "HTP" + std::to_string(i);
+            opt_device_configs[i].mdev_group.clear();
+        }
+    };
+
+    if (str_devices && str_devices[0] != '\0' && strcmp(str_devices, "auto") != 0) {
         bool is_single_number = true;
         for (int i = 0; str_devices[i] != '\0'; i++) {
             if (!isdigit((unsigned char)str_devices[i])) {
@@ -8064,16 +8090,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
             }
         }
         if (is_single_number) {
-            int n = atoi(str_devices);
-            if (n < 1) n = 1;
-            if (n > GGML_HEXAGON_MAX_SESSIONS) n = GGML_HEXAGON_MAX_SESSIONS;
-            opt_ndev = n;
-            for (size_t i = 0; i < opt_ndev; i++) {
-                opt_device_configs[i].physical_idx = 0;
-                opt_device_configs[i].virtual_idx  = (int)i;
-                opt_device_configs[i].name         = "HTP" + std::to_string(i);
-                opt_device_configs[i].mdev_group.clear();
-            }
+            set_virtual_devices(atoi(str_devices));
         } else {
             std::string s_devices(str_devices);
             std::vector<std::string> items;
@@ -8226,11 +8243,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
             }
         }
     } else {
-        opt_ndev = 1;
-        opt_device_configs[0].physical_idx = 0;
-        opt_device_configs[0].virtual_idx  = 0;
-        opt_device_configs[0].name         = "HTP0";
-        opt_device_configs[0].mdev_group.clear();
+        // auto: expose the max virtual sessions, they are opened only when a model uses them (see --device auto)
+        set_virtual_devices(GGML_HEXAGON_MAX_VSESSIONS);
     }
 
 #if defined(__ANDROID__)

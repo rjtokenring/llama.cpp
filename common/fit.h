@@ -55,6 +55,16 @@ struct common_device_memory_data {
 
 using common_device_memory_data_vec = std::vector<common_device_memory_data>;
 
+// pick the shortest prefix of the GPU device list on which the model fits with `margins` free on every device
+//   - layers are split equally, as llama_model does by default
+//   - throws std::runtime_error if no prefix fits or a probe fails
+std::vector<ggml_backend_dev_t> common_fit_devices(
+                         const char * path_model,
+           const llama_model_params * mparams,
+         const llama_context_params * cparams,
+                       const size_t * margins,               // margins of memory to leave per device in bytes
+                     ggml_log_level   log_level);
+
 // Load a model + context with no_alloc and return the per-device memory breakdown.
 common_device_memory_data_vec common_get_device_memory_data(
                          const char * path_model,
