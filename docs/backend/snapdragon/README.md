@@ -242,20 +242,21 @@ address space window, eliminating runtime buffer re-mapping overhead.
 #### Automatic device selection (`--device auto`)
 
 `--device auto` picks the smallest number of sessions on which the model fits. It loads the model without allocating
-memory (the same probe used by `--fit`) on `HTP0`, then `HTP0,HTP1`, and so on, and stops at the first prefix where
-every session has at least `--fit-target` MiB left after weights, KV cache and compute buffers. Only the sessions that
-are used are opened. Layers are split equally between the chosen sessions, exactly like an explicit `--device HTP0,HTP1`.
+memory (a dry run that builds the real graph) on `HTP0`, then `HTP0,HTP1`, and so on, and stops at the first prefix where
+weights, KV cache and compute buffers of every session stay within the free memory the device reports. Only the sessions
+that are used are opened. Layers are split equally between the chosen sessions, exactly like an explicit `--device HTP0,HTP1`.
 
 By default the backend exposes 4 virtual sessions on NPU 0, so no `GGML_HEXAGON_DEVICES` setting is needed:
 
 ```bash
 ./scripts/snapdragon/run.py --target adb --devices auto -- \
-    llama-server -m models/Qwen3.5-4B-Q4_0.gguf -c 16384 -np 4 -fit off -fitt 512
+    llama-server -m models/Qwen3.5-4B-Q4_0.gguf -c 16384 -np 4 -fit off
 ```
 
 Notes:
-- The default `--fit-target` margin is 1024 MiB per device, which is large for a ~3.1GB window. Use `-fitt` to tune it
-  (e.g. 512 MiB). The margin only covers estimation error: a single buffer larger than what FastRPC can map still fails.
+- The free memory a session reports is `GGML_HEXAGON_VMEM_USABLE` (default 2100 MiB), not the whole ~3.1GB window: on a
+  QCS8300 sessions filled beyond ~2.1GB failed their buffer mappings. Raise or lower it only after measuring. A single
+  buffer larger than what FastRPC can map still fails regardless of this limit.
 - `-fit off` is recommended together with `--device auto`. `--fit` would rather move layers to the CPU than add a session.
 - If the model does not fit on any number of sessions, or a session cannot be opened (e.g. the system-wide FastRPC
   session limit was reached by other processes), the load fails with an error instead of guessing.
@@ -341,6 +342,10 @@ on 4 physical NPUs, or `--devices 'HTP0[0-1:0],HTP1[0-1:1]'` on 2 physical NPUs 
     - `HTP0[0-1]`: A single logical device `HTP0` that groups physical cores 0 and 1.
     - `HTP0[0-1],HTP1[2-3]`: Two layer-split devices across 4 physical NPUs (cores 0-1 and 2-3).
     - `HTP0[0-1:0],HTP1[0-1:1]`: Two layer-split devices across 2 physical NPUs using virtual sessions 0 and 1.
+
+- `GGML_HEXAGON_VMEM_USABLE` (default: 2100, in MiB)
+  Memory a session reports as free to llama.cpp (`--device auto`, `--fit`, `--list-devices`). The total stays the VA
+  window. `0` reports the whole window.
 
 - `GGML_HEXAGON_NDEV` (deprecated)
   Replaced by `GGML_HEXAGON_DEVICES`. Controls the number of virtual sessions to allocate on physical NPU `0`.

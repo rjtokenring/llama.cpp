@@ -1,6 +1,5 @@
 #include "fit.h"
 
-#include "common.h"
 #include "json.h"
 #include "log.h"
 
@@ -175,80 +174,6 @@ common_device_memory_data_vec common_get_device_memory_data(
         ret[i].compute = impl[i].mb.compute;
     }
     return ret;
-}
-
-std::vector<ggml_backend_dev_t> common_fit_devices(
-        const char * path_model,
-        const llama_model_params * mparams,
-        const llama_context_params * cparams,
-        const size_t * margins,
-        ggml_log_level log_level) {
-    constexpr int64_t MiB = 1024*1024;
-
-    std::vector<ggml_backend_dev_t> cands;
-    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            cands.push_back(dev);
-        }
-    }
-    if (cands.empty()) {
-        return cands;
-    }
-
-    // a prefix probe is meaningless when the user already fixed the split
-    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-        LOG_WRN("%s: split mode tensor, using all %zu devices\n", __func__, cands.size());
-        return cands;
-    }
-    for (size_t i = 0; mparams->tensor_split && i < cands.size(); i++) {
-        if (mparams->tensor_split[i] != 0.0f) {
-            LOG_WRN("%s: tensor split set by user, using all %zu devices\n", __func__, cands.size());
-            return cands;
-        }
-    }
-
-    llama_context_params cparams_copy = *cparams;
-
-    for (size_t n = 1; n <= cands.size(); n++) {
-        std::vector<ggml_backend_dev_t> prefix(cands.begin(), cands.begin() + n);
-        prefix.push_back(nullptr);
-
-        llama_model_params mparams_copy = *mparams;
-        mparams_copy.devices = prefix.data();
-
-        std::vector<ggml_backend_dev_t> devs;
-        uint32_t hp_ngl = 0;
-        uint32_t hp_nct = 0;
-        uint32_t hp_nex = 0;
-        common_device_memory_data_vec dmds;
-        try {
-            dmds = common_get_device_memory_data(path_model, &mparams_copy, &cparams_copy, devs, hp_ngl, hp_nct, hp_nex, log_level);
-
-            // llama_context uses n_ctx_train in total for n_ctx == 0, resolve it like common_fit_params does
-            if (cparams->n_ctx == 0 && cparams->n_seq_max > 1) {
-                cparams_copy.n_ctx = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct) * cparams->n_seq_max, UINT32_MAX);
-                dmds = common_get_device_memory_data(path_model, &mparams_copy, &cparams_copy, devs, hp_ngl, hp_nct, hp_nex, log_level);
-            }
-        } catch (const std::runtime_error & e) {
-            throw std::runtime_error(string_format("probing %zu device(s) failed: %s", n, e.what()));
-        }
-
-        bool fits = true;
-        for (size_t i = 0; i < devs.size(); i++) {
-            const int64_t used = dmds[i].model + dmds[i].context + dmds[i].compute;
-            const bool ok = dmds[i].free - used >= (int64_t) margins[i];
-            LOG_INF("%s: %zu device(s): %s needs %" PRId64 " MiB, has %" PRId64 " MiB free, margin %" PRId64 " MiB -> %s\n",
-                __func__, n, ggml_backend_dev_name(devs[i]), used/MiB, dmds[i].free/MiB, (int64_t) margins[i]/MiB, ok ? "ok" : "too small");
-            fits = fits && ok;
-        }
-        if (fits) {
-            prefix.pop_back();
-            return prefix;
-        }
-    }
-
-    throw std::runtime_error(string_format("model does not fit on %zu device(s)", cands.size()));
 }
 
 static void common_params_fit_impl(

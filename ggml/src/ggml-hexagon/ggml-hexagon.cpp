@@ -92,6 +92,7 @@ static size_t opt_ndev    = 1;
 static size_t opt_nhvx    = 0; // use all
 static int    opt_nhmx    = 1; // when set, enable HMX; when 0, use HVX only
 static size_t opt_vmem    = HTP_OP_MAX_VMEM_DEFAULT;  // max available va space for buffer mappings
+static size_t opt_vmem_usable = 2100ul * 1024 * 1024; // what a session can hold before mappings start to fail, 0 = full window
 static size_t opt_mbuf    = 1ul * 1024 * 1024 * 1024; // max buffer size
 static int    opt_etm     = 0;
 static int    opt_verbose = 0;
@@ -7273,8 +7274,9 @@ static void ggml_backend_hexagon_device_get_memory(ggml_backend_dev_t dev, size_
         vmem = opt_vmem > shm ? opt_vmem - shm : opt_vmem;
     }
 
-    *free  = vmem;
+    // free is the practical limit: on QCS8300 sessions filled past ~2.1 GB fail their buffer mappings
     *total = vmem;
+    *free  = opt_vmem_usable && opt_vmem_usable < vmem ? opt_vmem_usable : vmem;
 }
 
 static enum ggml_backend_dev_type ggml_backend_hexagon_device_get_type(ggml_backend_dev_t dev) {
@@ -8007,6 +8009,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
+    const char * str_vmem_usable = getenv("GGML_HEXAGON_VMEM_USABLE");
     const char * str_mbuf     = getenv("GGML_HEXAGON_MBUF");
     const char * str_optrace  = getenv("GGML_HEXAGON_OPTRACE");
     const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
@@ -8059,6 +8062,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_ar_select = str_ar_select ? atoi(str_ar_select)                   : opt_ar_select;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
     opt_vmem      = str_vmem     ? strtoul(str_vmem, NULL, 0) * MiB       : opt_vmem;
+    opt_vmem_usable = str_vmem_usable ? strtoul(str_vmem_usable, NULL, 0) * MiB : opt_vmem_usable;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf) != 0                 : opt_hostbuf;
 
     // Parse device configuration
