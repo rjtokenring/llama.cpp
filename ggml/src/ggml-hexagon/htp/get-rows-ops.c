@@ -205,6 +205,9 @@ GET_ROWS_THREAD_DT_FN(f32,  F32_BYTES,  int64_t, { if (cur_elems > 0) hvx_copy_f
 GET_ROWS_THREAD_DT_FN(f16,  F16_BYTES,  int32_t, { hvx_dequantize_row_f16_f32((float *)dst_spad, src_spad, ne00); })
 GET_ROWS_THREAD_DT_FN(f16,  F16_BYTES,  int64_t, { hvx_dequantize_row_f16_f32((float *)dst_spad, src_spad, ne00); })
 
+GET_ROWS_THREAD_DT_FN(bf16, F16_BYTES,  int32_t, { hvx_dequantize_row_bf16_f32((float *)dst_spad, src_spad, ne00); })
+GET_ROWS_THREAD_DT_FN(bf16, F16_BYTES,  int64_t, { hvx_dequantize_row_bf16_f32((float *)dst_spad, src_spad, ne00); })
+
 GET_ROWS_THREAD_DT_FN(q8_0, Q8_0_BYTES, int32_t, { hvx_dequantize_row_q8_0_f32((float *)dst_spad, src_spad, ne00); })
 GET_ROWS_THREAD_DT_FN(q8_0, Q8_0_BYTES, int64_t, { hvx_dequantize_row_q8_0_f32((float *)dst_spad, src_spad, ne00); })
 
@@ -213,6 +216,7 @@ int op_get_rows(struct htp_ops_context * octx) {
 
     if (octx->src[0]->type != HTP_TYPE_F32 &&
         octx->src[0]->type != HTP_TYPE_F16 &&
+        octx->src[0]->type != HTP_TYPE_BF16 &&
         octx->src[0]->type != HTP_TYPE_Q8_0 &&
         octx->src[0]->type != HTP_TYPE_I32) {
         return HTP_STATUS_NO_SUPPORT;
@@ -276,6 +280,7 @@ int op_get_rows(struct htp_ops_context * octx) {
         switch (octx->src[0]->type) {
             case HTP_TYPE_F32:  q_func = (work_queue_func_t)(is_i32 ? get_rows_thread_f32_int32_t  : get_rows_thread_f32_int64_t);  break;
             case HTP_TYPE_F16:  q_func = (work_queue_func_t)(is_i32 ? get_rows_thread_f16_int32_t  : get_rows_thread_f16_int64_t);  break;
+            case HTP_TYPE_BF16: q_func = (work_queue_func_t)(is_i32 ? get_rows_thread_bf16_int32_t : get_rows_thread_bf16_int64_t); break;
             case HTP_TYPE_Q8_0: q_func = (work_queue_func_t)(is_i32 ? get_rows_thread_q8_0_int32_t : get_rows_thread_q8_0_int64_t); break;
             case HTP_TYPE_I32:  q_func = (work_queue_func_t)(is_i32 ? get_rows_thread_st_int32_t   : get_rows_thread_st_int64_t);   break;
             default:            return HTP_STATUS_NO_SUPPORT;

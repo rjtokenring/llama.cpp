@@ -1655,7 +1655,8 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
 
     // Compute src0_nrows_per_thread
     mmctx->src0_nrows_per_thread  = fastdiv(nrows + octx->n_threads - 1, &octx->n_threads_div);
-    if (is_repacked) {
+    if (is_repacked || src2) {
+        // tiles are 32 rows; the fused ADD tail (hvx_add_f32_uaa) needs 128-byte aligned dst/src2 slices too
         mmctx->src0_nrows_per_thread = hex_round_up(mmctx->src0_nrows_per_thread, 32);
     } else {
         mmctx->src0_nrows_per_thread += (mmctx->src0_nrows_per_thread & 1); // round up to even
@@ -1745,6 +1746,16 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
             src1_row_size          = hex_round_up(ne10 * 4, 128);
             break;
 
+        case HTP_MM_KERNEL_HVX_BF16_F32_VTCM:
+            quant_task_func        = NULL;
+            need_quant             = false;
+            mmctx->type            = "f32-bf16";
+            mmctx->vec_dot_1x1     = vec_dot_bf16_f32_aa_1x1;
+            mmctx->vec_dot_2x1     = vec_dot_bf16_f32_aa_2x1;
+            mmctx->vec_dot_2x2     = vec_dot_bf16_f32_aa_2x2;
+            src1_row_size          = hex_round_up(ne10 * 4, 128);
+            break;
+
         case HTP_MM_KERNEL_HVX_QUANT_BLOCK:
         case HTP_MM_KERNEL_HVX_QUANT_ROW:
         default:
@@ -1785,6 +1796,7 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
 
     if (kparams->kernel_type == HTP_MM_KERNEL_HVX_F16_F16_VTCM ||
         kparams->kernel_type == HTP_MM_KERNEL_HVX_F32_F32_VTCM ||
+        kparams->kernel_type == HTP_MM_KERNEL_HVX_BF16_F32_VTCM ||
         kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW ||
         kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_BLOCK) {
         mmctx->vtcm_src1_size_per_thread = L.src1_bytes;
@@ -2021,6 +2033,18 @@ static void convert_f16_worker_loop(unsigned int n, unsigned int i, void *data) 
         int start = task_id * state->n_tiles_per_task;
         int end   = hex_smin(start + state->n_tiles_per_task, state->n_tot_tiles);
         convert_f16_weight_to_fp16_tiles_task(state, start, end);
+    }
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_DEQUANT, i);
+}
+
+static void convert_bf16_worker_loop(unsigned int n, unsigned int i, void *data) {
+    tiled_dequantize_state_t *state = (tiled_dequantize_state_t *)data;
+    struct htp_thread_trace * tr = &state->traces[i];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_DEQUANT, i);
+    for (unsigned int task_id = i; task_id < (unsigned int)state->n_tasks; task_id += n) {
+        int start = task_id * state->n_tiles_per_task;
+        int end   = hex_smin(start + state->n_tiles_per_task, state->n_tot_tiles);
+        convert_bf16_weight_to_fp16_tiles_task(state, start, end);
     }
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_DEQUANT, i);
 }
@@ -2698,6 +2722,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
         case HTP_TYPE_Q5_K:   dequant_worker_fn = dequantize_tiled_worker_loop_q5_k; break;
         case HTP_TYPE_Q6_K:   dequant_worker_fn = dequantize_tiled_worker_loop_q6_k; break;
         case HTP_TYPE_F16:    dequant_worker_fn = convert_f16_worker_loop; break;
+        case HTP_TYPE_BF16:   dequant_worker_fn = convert_bf16_worker_loop; break;
         case HTP_TYPE_F32:    dequant_worker_fn = quantize_f32_worker_loop; break;
         default:
             return -1;
@@ -2706,7 +2731,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
     const int n_k_tiles = k / HTP_MM_HMX_TILE_N_COLS;
     const struct fastdiv_values n_k_tiles_div = init_fastdiv_values(n_k_tiles);
 
-    const bool is_quant       = (weight_type != HTP_TYPE_F16 && weight_type != HTP_TYPE_F32);
+    const bool is_quant       = !htp_mm_weight_is_float(weight_type);
     const size_t vec_dot_size = k * sizeof(__fp16);
     const size_t vtcm_budget  = ctx->vtcm_size;
 
@@ -2964,6 +2989,7 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
         case HTP_TYPE_Q5_K:   dequant_worker_fn = dequantize_tiled_worker_loop_q5_k; break;
         case HTP_TYPE_Q6_K:   dequant_worker_fn = dequantize_tiled_worker_loop_q6_k; break;
         case HTP_TYPE_F16:    dequant_worker_fn = convert_f16_worker_loop; break;
+        case HTP_TYPE_BF16:   dequant_worker_fn = convert_bf16_worker_loop; break;
         case HTP_TYPE_F32:    dequant_worker_fn = quantize_f32_worker_loop; break;
         default:
             return HTP_STATUS_NO_SUPPORT;
@@ -2972,7 +2998,7 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
     const int n_k_tiles = k / HTP_MM_HMX_TILE_N_COLS;
     const struct fastdiv_values n_k_tiles_div = init_fastdiv_values(n_k_tiles);
 
-    const bool is_quant       = (weight_type != HTP_TYPE_F16 && weight_type != HTP_TYPE_F32);
+    const bool is_quant       = !htp_mm_weight_is_float(weight_type);
     const size_t vtcm_budget  = ctx->vtcm_size;
 
     const int m_chunk_n_rows  = kparams->m_chunk;
@@ -3560,6 +3586,7 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
         case HTP_TYPE_Q5_K:   dequant_worker_fn = dequantize_tiled_worker_loop_q5_k; break;
         case HTP_TYPE_Q6_K:   dequant_worker_fn = dequantize_tiled_worker_loop_q6_k; break;
         case HTP_TYPE_F16:    dequant_worker_fn = convert_f16_worker_loop; break;
+        case HTP_TYPE_BF16:   dequant_worker_fn = convert_bf16_worker_loop; break;
         case HTP_TYPE_F32:    dequant_worker_fn = quantize_f32_worker_loop; break;
         default:
             return -1;
@@ -3568,7 +3595,7 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
     const int n_k_tiles = k / HTP_MM_HMX_TILE_N_COLS;
     const struct fastdiv_values n_k_tiles_div = init_fastdiv_values(n_k_tiles);
 
-    const bool is_quant   = (weight_type != HTP_TYPE_F16 && weight_type != HTP_TYPE_F32);
+    const bool is_quant   = !htp_mm_weight_is_float(weight_type);
 
     const size_t vec_dot_size = k * sizeof(__fp16);
     const size_t vtcm_budget  = ctx->vtcm_size;

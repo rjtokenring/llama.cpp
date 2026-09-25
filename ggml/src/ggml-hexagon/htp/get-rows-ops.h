@@ -43,7 +43,8 @@ static inline void htp_get_rows_vtcm_layout_build(
         case 0: // HTP_TYPE_F32
             src0_row_size = ne00 * 4;
             break;
-        case 1: // HTP_TYPE_F16
+        case 1:  // HTP_TYPE_F16
+        case 30: // HTP_TYPE_BF16
             src0_row_size = ne00 * 2;
             break;
         case 8: // HTP_TYPE_Q8_0

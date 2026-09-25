@@ -286,7 +286,7 @@ static inline size_t ggml_hexagon_tiled_row_size(enum ggml_type type, int64_t ne
 }
 
 static inline bool ggml_hexagon_is_hmx_weight_type(enum ggml_type type) {
-    return type == GGML_TYPE_F16 || type == GGML_TYPE_F32 || ggml_hexagon_is_repack_type(type);
+    return type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_F32 || ggml_hexagon_is_repack_type(type);
 }
 
 struct ggml_hexagon_session;
@@ -4772,7 +4772,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
     kparams->n_hmx = 0;
     kparams->n_threads = sess->n_threads;
 
-    const bool is_quant = (wtype != GGML_TYPE_F16 && wtype != GGML_TYPE_F32);
+    const bool is_quant = (wtype != GGML_TYPE_F16 && wtype != GGML_TYPE_BF16 && wtype != GGML_TYPE_F32);
     const int src1_nrows = ne11 * ne12 * ne13;
 
     if (is_quant) {
@@ -4879,14 +4879,15 @@ static void ggml_hexagon_precompute_hvx_mm_params(
         kparams->kernel_type = HTP_MM_KERNEL_UNSUPPORTED;
         return;
     } else {
-        // F32 HVX
+        // F32 HVX, or BF16 weights with the same fp32 activation layout
+        const int kernel_type = (wtype == GGML_TYPE_BF16) ? HTP_MM_KERNEL_HVX_BF16_F32_VTCM : HTP_MM_KERNEL_HVX_F32_F32_VTCM;
         struct htp_mm_hvx_vtcm_layout L;
         uint32_t m_chunk = 0;
         if (htp_mm_hvx_solve_vtcm_params(
-                HTP_MM_KERNEL_HVX_F32_F32_VTCM, wtype, ne10, src1_nrows, sess->n_threads,
+                kernel_type, wtype, ne10, src1_nrows, sess->n_threads,
                 dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, 16, vtcm_budget,
                 &L, &m_chunk)) {
-            kparams->kernel_type = HTP_MM_KERNEL_HVX_F32_F32_VTCM;
+            kparams->kernel_type = kernel_type;
             kparams->m_chunk = (m_chunk < (uint32_t) src1_nrows) ? m_chunk : 0;
             kparams->src1_row_size = hex_round_up(ne10 * 4, 128);
             kparams->vtcm_size = L.total_bytes;
@@ -5651,6 +5652,7 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
             break;
 
         case GGML_TYPE_F32:
+        case GGML_TYPE_BF16:
             if (src1->type != GGML_TYPE_F32) {
                 return false;
             }
@@ -6031,7 +6033,7 @@ static bool ggml_hexagon_supported_get_rows(const struct ggml_hexagon_session * 
         return false;
     }
 
-    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 &&
+    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16 &&
         src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_I32) {
         return false;
     }
@@ -7975,6 +7977,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     static_assert((unsigned int) HTP_TYPE_Q5_K == (unsigned int) GGML_TYPE_Q5_K,
                   "please update hexagon_type to match ggml_type");
     static_assert((unsigned int) HTP_TYPE_Q6_K == (unsigned int) GGML_TYPE_Q6_K,
+                  "please update hexagon_type to match ggml_type");
+    static_assert((unsigned int) HTP_TYPE_BF16 == (unsigned int) GGML_TYPE_BF16,
                   "please update hexagon_type to match ggml_type");
 
     const char * str_verbose  = getenv("GGML_HEXAGON_VERBOSE");

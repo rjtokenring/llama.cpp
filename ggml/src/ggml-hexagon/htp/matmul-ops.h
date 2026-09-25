@@ -71,6 +71,8 @@ enum htp_mm_kernel_type {
     // HVX quantized paths
     HTP_MM_KERNEL_HVX_QUANT_ROW,      // standard row-wise parallel quantization
     HTP_MM_KERNEL_HVX_QUANT_BLOCK,    // parallel block-wise quantization
+
+    HTP_MM_KERNEL_HVX_BF16_F32_VTCM,  // bf16 weights, fp32 activations laid out as in the F32 kernel
 };
 
 // Op-specific struct for precomputed matmul params
@@ -266,12 +268,18 @@ static inline size_t htp_mm_get_tiled_row_stride(int weight_type, uint32_t k) {
         case HTP_TYPE_MXFP4:
             return (size_t) nb * htp_mm_get_weight_tile_size(weight_type);
         case HTP_TYPE_F16:
+        case HTP_TYPE_BF16:
             return (size_t) k * sizeof(__fp16);
         case HTP_TYPE_F32:
             return (size_t) k * sizeof(float);
         default:
             return 0;
     }
+}
+
+// float weights are streamed row by row and converted to fp16 on the fly, the rest are pre-tiled
+static inline bool htp_mm_weight_is_float(int weight_type) {
+    return weight_type == HTP_TYPE_F16 || weight_type == HTP_TYPE_BF16 || weight_type == HTP_TYPE_F32;
 }
 
 static inline size_t htp_mm_round_up(size_t n, size_t m) {
@@ -286,7 +294,7 @@ static inline void htp_mm_hmx_get_2d_chunk_costs(
     int wtype, uint32_t k, bool pipeline, uint32_t aligned_tile_size,
     size_t * size_per_n_out, size_t * size_per_m_out, size_t * size_per_mn_out
 ) {
-    const bool is_quant = (wtype != HTP_TYPE_F16 && wtype != HTP_TYPE_F32);
+    const bool is_quant = !htp_mm_weight_is_float(wtype);
     const size_t row_stride = htp_mm_get_tiled_row_stride(wtype, k);
     const size_t vec_dot_size = k * sizeof(uint16_t);
     const uint32_t n_k_tiles = k / HTP_MM_HMX_TILE_N_COLS;
@@ -420,7 +428,7 @@ static inline void htp_mm_hmx_vtcm_layout_build(
         off = off_group_a + hex_smax(group_b_size, group_c_size);
     } else {
         // HTP_MM_KERNEL_HMX_2D
-        const bool is_quant = (wtype != HTP_TYPE_F16 && wtype != HTP_TYPE_F32);
+        const bool is_quant = !htp_mm_weight_is_float(wtype);
         const size_t row_stride = htp_mm_get_tiled_row_stride(wtype, k);
         const size_t vec_dot_size = k * sizeof(uint16_t);
         const uint32_t n_k_tiles = k / HTP_MM_HMX_TILE_N_COLS;
@@ -564,7 +572,8 @@ static inline void htp_mm_hvx_vtcm_layout_build(
                 act_raw_sz = hex_round_up(hex_round_up(ne10 * sizeof(float), 128) * src1_nrows, 128);
                 break;
             }
-            case HTP_MM_KERNEL_HVX_F32_F32_VTCM: {
+            case HTP_MM_KERNEL_HVX_F32_F32_VTCM:
+            case HTP_MM_KERNEL_HVX_BF16_F32_VTCM: {
                 size_t f32_src1_row_size = htp_mm_round_up(ne10 * 4, 128);
                 src1_sz    = htp_mm_round_up(f32_src1_row_size * src1_nrows, 256);
                 src0_sz    = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256) * n_threads;

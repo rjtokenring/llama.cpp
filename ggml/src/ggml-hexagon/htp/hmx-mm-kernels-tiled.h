@@ -689,6 +689,50 @@ void convert_f16_weight_to_fp16_tiles_task(
     }
 }
 
+// Same as convert_f16_weight_to_fp16_tiles_task, the rows are bf16 and get converted before the scatter.
+static __attribute__((noinline))
+void convert_bf16_weight_to_fp16_tiles_task(
+        const tiled_dequantize_state_t *state,
+        uint32_t start_tile, uint32_t end_tile) {
+
+    const uint32_t n_k_tiles = state->n_k_tiles;
+    const struct fastdiv_values n_k_tiles_div = state->n_k_tiles_div;
+
+    const HVX_Vector v_scat_base  = hvx_vmem(hmx_transpose_scatter_offsets);
+    const HVX_Vector v_scat_step  = Q6_V_vsplat_R(4);
+    const HVX_VectorPred q_mask64 = Q6_Q_vsetq_R(64);
+
+    unsigned ct = fastdiv((unsigned)start_tile, &n_k_tiles_div);
+    unsigned kt = fastmodulo((unsigned)start_tile, n_k_tiles, &n_k_tiles_div);
+
+    for (unsigned t = start_tile; t < (unsigned)end_tile; ) {
+        if (kt >= (unsigned)n_k_tiles) { kt = 0; ct++; }
+
+        __fp16 *tile_base = state->dst + t * HTP_MM_HMX_TILE_N_ELMS;
+        {
+            uint32_t byte_off = kt * 32 * sizeof(uint16_t);
+
+            HVX_Vector v_off = v_scat_base;
+            for (uint32_t r = 0; r < HTP_MM_HMX_TILE_N_ROWS; r += 2) {
+                uint32_t row0 = ct * HTP_MM_HMX_TILE_N_COLS + r;
+                uint32_t row1 = row0 + 1;
+
+                const uint8_t *r0 = state->src + row0 * state->row_stride;
+                const uint8_t *r1 = state->src + row1 * state->row_stride;
+
+                HVX_Vector v0 = hvx_vec_bf16_to_f16(hvx_vmemu((const uint16_t *)(r0 + byte_off)));
+                HVX_Vector v1 = (row1 < state->n_cols) ? hvx_vec_bf16_to_f16(hvx_vmemu((const uint16_t *)(r1 + byte_off))) : Q6_V_vzero();
+
+                Q6_vscatter_QRMVwV(q_mask64, (size_t)tile_base, HTP_MM_HMX_TILE_SIZE - 1, v_off, v0);
+                v_off = Q6_Vw_vadd_VwVw(v_off, v_scat_step);
+                Q6_vscatter_QRMVwV(q_mask64, (size_t)tile_base, HTP_MM_HMX_TILE_SIZE - 1, v_off, v1);
+                v_off = Q6_Vw_vadd_VwVw(v_off, v_scat_step);
+            }
+        }
+        ++t; ++kt;
+    }
+}
+
 static __attribute__((noinline))
 void quantize_f32_weight_to_fp16_tiles_task(
         const tiled_dequantize_state_t *state,

@@ -137,6 +137,17 @@ static inline HVX_Vector hvx_vec_f32_to_f16(HVX_Vector v0, HVX_Vector v1) {
     return Q6_Vh_vdeal_Vh(hvx_vec_f32_to_f16_shuff(v0, v1));
 }
 
+// bf16 is the high half of the fp32 bit pattern: interleaving each bf16 (odd halfwords) with a zero
+// low half gives the fp32 values, elements 0..31 in the low vector and 32..63 in the high one.
+static inline HVX_VectorPair hvx_vec_bf16_to_f32(HVX_Vector v) {
+    return Q6_W_vshuff_VVR(v, Q6_V_vzero(), -2);
+}
+
+static inline HVX_Vector hvx_vec_bf16_to_f16(HVX_Vector v) {
+    HVX_VectorPair p = hvx_vec_bf16_to_f32(v);
+    return hvx_vec_f32_to_f16(Q6_V_lo_W(p), Q6_V_hi_W(p));
+}
+
 #if __HVX_ARCH__ >= 79
 static inline HVX_VectorPair hvx_vec_f16_to_f32_shuff(HVX_Vector v) {
     const HVX_Vector one = hvx_vec_splat_f16(1.0);

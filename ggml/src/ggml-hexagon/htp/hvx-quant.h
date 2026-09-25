@@ -160,6 +160,20 @@ static inline void hvx_dequantize_row_f16_f32(float * restrict dst_ptr, const vo
     }
 }
 
+static inline void hvx_dequantize_row_bf16_f32(float * restrict dst_ptr, const void * restrict src_ptr, int n) {
+    const int nb = n / 32;
+    const uint16_t * src = (const uint16_t *) src_ptr;
+
+    for (int i = 0; i < nb; i++) {
+        HVX_Vector v_bf16 = *(const HVX_UVector *) (src + i * 32);
+        HVX_VectorPair vp_f32 = hvx_vec_bf16_to_f32(v_bf16);
+        HVX_Vector res = Q6_V_lo_W(vp_f32);
+
+        float * block_dst = dst_ptr + i * 32;
+        hvx_vmem(block_dst) = res;
+    }
+}
+
 
 
 #endif // HVX_QUANT_H
