@@ -470,7 +470,8 @@ struct common_params {
 
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
-    bool devices_auto = false; // --device auto: use the fewest devices whose free memory fits the model
+    bool        devices_auto = false; // --device <backend>: use the fewest devices of that backend whose free memory fits the model
+    std::string devices_auto_reg;     // name of that backend, e.g. "HTP"
 
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors

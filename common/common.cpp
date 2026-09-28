@@ -1251,25 +1251,26 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
-// pick the shortest prefix of the GPU device list whose free memory holds the model, context and compute buffers
+// pick the shortest prefix of the GPU devices of backend `reg` whose free memory holds the model, context and compute buffers
 //   - layers are split equally, as llama_model does by default
 //   - throws std::runtime_error if no prefix fits or a probe fails
 static std::vector<ggml_backend_dev_t> common_auto_devices(
         const char * path_model,
         const llama_model_params * mparams,
         const llama_context_params * cparams,
+        const std::string & reg,
         ggml_log_level log_level) {
     constexpr int64_t MiB = 1024*1024;
 
     std::vector<ggml_backend_dev_t> cands;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU && reg == ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev))) {
             cands.push_back(dev);
         }
     }
     if (cands.empty()) {
-        return cands;
+        throw std::runtime_error(string_format("backend %s has no GPU devices", reg.c_str()));
     }
 
     // a prefix probe is meaningless when the user already fixed the split
@@ -1335,7 +1336,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.devices_auto && params.devices.empty()) {
         const int64_t t0_us = llama_time_us();
         try {
-            params.devices = common_auto_devices(params.model.path.c_str(), &mparams, &cparams,
+            params.devices = common_auto_devices(params.model.path.c_str(), &mparams, &cparams, params.devices_auto_reg,
                 params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
         } catch (const std::runtime_error & e) {
             COM_WRN("automatic device selection failed: %s\n", e.what());

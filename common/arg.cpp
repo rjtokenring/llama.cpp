@@ -2734,13 +2734,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-dev", "--device"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading (none = don't offload)\n"
-        "auto = fewest devices, in list order, whose free memory fits the model\n"
+        "a backend name (e.g. HTP) = fewest devices of that backend, in order, whose free memory fits the model\n"
         "use --list-devices to see a list of available devices",
         [](common_params & params, const std::string & value) {
-            if (value == "auto") {
-                params.devices_auto = true;
-                params.devices.clear();
-                return;
+            if (value != "none" && value.find(',') == std::string::npos) {
+                ggml_backend_load_all();
+                for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+                    const char * name = ggml_backend_reg_name(ggml_backend_reg_get(i));
+                    if (value.size() == strlen(name) && std::equal(value.begin(), value.end(), name,
+                            [](char a, char b) { return std::tolower((unsigned char) a) == std::tolower((unsigned char) b); })) {
+                        params.devices_auto     = true;
+                        params.devices_auto_reg = name;
+                        params.devices.clear();
+                        return;
+                    }
+                }
             }
             params.devices = parse_device_list(value);
         }

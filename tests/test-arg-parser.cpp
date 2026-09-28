@@ -186,10 +186,11 @@ static void test(void) {
     argv = {"binary_name", "-sm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
-    // --device auto sets the flag and leaves the device list empty
-    argv = {"binary_name", "-m", "model_file.gguf", "-dev", "auto"};
+    // --device <backend name> sets the auto flag and leaves the device list empty
+    argv = {"binary_name", "-m", "model_file.gguf", "-dev", "cpu"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.devices_auto == true);
+    assert(params.devices_auto_reg == "CPU");
     assert(params.devices.empty());
 
     {

@@ -254,7 +254,7 @@ def main():
     if devices_val.isdigit():
         hex_devices = devices_val
         cl_device = ""
-    elif devices_val == "auto":
+    elif devices_val.lower() in ("auto", "htp"):
         # llama.cpp picks the sessions itself, the backend exposes its default maximum
         hex_devices = ""
         cl_device = ""

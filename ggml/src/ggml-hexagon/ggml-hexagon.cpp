@@ -93,8 +93,11 @@ static size_t opt_ndev    = 1;
 static size_t opt_nhvx    = 0; // use all
 static int    opt_nhmx    = 1; // when set, enable HMX; when 0, use HVX only
 static size_t opt_vmem    = HTP_OP_MAX_VMEM_DEFAULT;  // max available va space for buffer mappings
-static size_t opt_vmem_usable = 2100ul * 1024 * 1024; // what a session can hold before mappings start to fail, 0 = full window
-static size_t opt_mbuf    = 1ul * 1024 * 1024 * 1024; // max buffer size
+static size_t opt_vmem_usable = 3328ul * 1024 * 1024; // 13 slots of 256 MiB: 16 in the 32-bit IOMMU space, minus MSI, op queue shm and cross-session clones; 0 = full window
+static bool   opt_vmem_measure = false; // GGML_HEXAGON_VMEM=0 : measure the mappable memory of every session at open
+
+template<typename T> std::vector<T> str_to_vec(const char* str);
+static size_t opt_mbuf    = 256ul * 1024 * 1024;      // max buffer size: the IOMMU maps buffers in power of two slots, small chunks pack a session tighter
 static int    opt_etm     = 0;
 static int    opt_verbose = 0;
 static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
@@ -2310,6 +2313,11 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(
     }
     try {
         ggml_hexagon_shared_buffer * sbuf = new ggml_hexagon_shared_buffer(sess, size, false);
+        // map large buffers now, in allocation order: the IOMMU gives each buffer a slot aligned to the next power of two
+        // of its size, a large buffer mapped late (first use) may not find a free slot after many small ones
+        if (size >= 128u * 1024 * 1024) {
+            sbuf->mmap();
+        }
         return ggml_backend_buffer_init(buffer_type, ggml_backend_hexagon_buffer_interface, sbuf, size);
     } catch (const std::exception & exc) {
         GGML_LOG_ERROR("ggml-hex: %s failed to allocate device buffer context: %s\n", dev_ctx->c_name(), exc.what());
@@ -2354,7 +2362,9 @@ static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffe
 }
 
 static size_t ggml_backend_hexagon_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
-    return opt_mbuf;
+    // keep the 4 KiB guard page inside opt_mbuf: the IOMMU maps every buffer in a slot aligned to the next power of two
+    // of its size, a full chunk of opt_mbuf + 4 KiB would take a slot twice as large
+    return opt_mbuf - 4096;
     GGML_UNUSED(buft);
 }
 
@@ -4009,33 +4019,42 @@ void ggml_hexagon_session::unclone_buffer(const ggml_hexagon_shared_buffer * sbu
     }
 }
 
-static size_t ggml_hexagon_measure_max_vmem(ggml_hexagon_session *sess) {
-    // Allocate a bunch pinned buffers till failure.
-    // This is kind of expensive but handy for figuring out exactly how much we can mmap on a specific device.
-    // Typically we're going to allocate all/most of these buffers anyway for the model weights.
-
-    std::vector<ggml_hexagon_shared_buffer *> sbufs;
-
-    const size_t MiB = 1024 * 1024;
-    const size_t GiB = MiB  * 1024;
-
-    size_t vmem = 0;
-    size_t step = 256u * MiB;
-
+// how many buffers of `size` bytes (plus the 4 KiB guard page) map in this session, stops at `max_total` bytes
+static size_t ggml_hexagon_count_maps(ggml_hexagon_session *sess, size_t size, size_t max_total) {
+    std::vector<ggml_hexagon_shared_buffer *> bufs;
     try {
-        sbufs.push_back(new ggml_hexagon_shared_buffer(sess, GiB, true)); vmem += GiB;
-        sbufs.push_back(new ggml_hexagon_shared_buffer(sess, GiB, true)); vmem += GiB;
-        sbufs.push_back(new ggml_hexagon_shared_buffer(sess, GiB, true)); vmem += GiB;
-
-        while (1) {
-            sbufs.push_back(new ggml_hexagon_shared_buffer(sess, step, true));
-            vmem += step;
+        while ((bufs.size() + 1) * size <= max_total) {
+            auto b = new ggml_hexagon_shared_buffer(sess, size, false);
+            bufs.push_back(b);
+            b->mmap();
         }
     } catch (...) { }
+    const size_t n = bufs.size();
+    for (auto b : bufs) { delete b; }
+    return n;
+}
 
-    for (auto b : sbufs) { delete b; }
+// Probe the IOVA layout of the session with a few small tests (GGML_HEXAGON_VMEM=0). Total memory in flight stays under 3.5 GiB:
+// the dma-buf heap keeps freed pages in a pool, large alloc/free churn has taken the board down.
+static size_t ggml_hexagon_measure_max_vmem(ggml_hexagon_session *sess) {
+    const size_t KiB = 1024;
+    const size_t MiB = 1024 * KiB;
+    const size_t cap = 3584 * MiB;
 
-    return vmem - step; // backoff to account for overhead from internal mappings
+    struct { const char * what; size_t size; } tests[] = {
+        { "1 GiB + 4 KiB (2 GiB aligned slot)", 1024 * MiB },
+        { "1 GiB exact  (1 GiB aligned slot)",  1024 * MiB - 4 * KiB },
+        { "512 MiB exact (512 MiB slot)",       512 * MiB - 4 * KiB },
+        { "640 MiB (1 GiB slot)",               640 * MiB },
+        { "256 MiB exact (256 MiB slot)",       256 * MiB - 4 * KiB },
+    };
+    size_t best = 0;
+    for (auto & t : tests) {
+        const size_t n = ggml_hexagon_count_maps(sess, t.size, cap);
+        GGML_LOG_INFO("ggml-hex: %s %-38s : %zu buffers map (%zu MiB)\n", sess->c_name(), t.what, n, n * t.size / MiB);
+        best = std::max(best, n * t.size);
+    }
+    return best;
 }
 
 void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) noexcept(false) {
@@ -4226,12 +4245,14 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
         this->mdev_fence_slot = this->alloc_fence(this->mdev.count);
     }
 
-    if (!opt_vmem) {
-        opt_vmem = ggml_hexagon_measure_max_vmem(this);
-        GGML_LOG_INFO("ggml-hex: %s measured max vmem %zu\n", this->c_name(), opt_vmem);
-    }
     const size_t shm_size = this->op_queue->shm_size();
-    this->max_vmem = (opt_vmem > shm_size) ? (opt_vmem - shm_size) : opt_vmem;
+    if (opt_vmem_measure) {
+        // the op queue shm is already mapped, so the measured value is what is left for buffers
+        this->max_vmem = ggml_hexagon_measure_max_vmem(this);
+        GGML_LOG_INFO("ggml-hex: %s measured max vmem %zu MiB\n", this->c_name(), this->max_vmem / (1024 * 1024));
+    } else {
+        this->max_vmem = (opt_vmem > shm_size) ? (opt_vmem - shm_size) : opt_vmem;
+    }
 
     this->op_batch = new ggml_hexagon_opbatch(this, opt_opbatch, this->max_vmem);
 
@@ -4240,6 +4261,27 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
     if (err != 0) {
         GGML_LOG_ERROR("ggml-hex: %s failed to start session: 0x%08x\n", this->c_name(), (unsigned) err);
         throw std::runtime_error("ggml-hex: iface start failed (see log for details)");
+    }
+
+    // GGML_HEXAGON_VMEM=0 + GGML_HEXAGON_VMEM_SEQ="67,1023,256,100,131,1016" : replay a sequence of buffer sizes (MiB, +4 KiB guard)
+    // after the session is fully started, to compare with the mappings of a real load
+    if (opt_vmem_measure) {
+        if (const char * seq = getenv("GGML_HEXAGON_VMEM_SEQ")) {
+            const size_t MiB = 1024 * 1024;
+            std::vector<ggml_hexagon_shared_buffer *> bufs;
+            size_t total = 0;
+            for (auto sz : str_to_vec<size_t>(seq)) {
+                const char * res = "ok";
+                try {
+                    auto b = new ggml_hexagon_shared_buffer(this, sz * MiB - 4096, false);
+                    bufs.push_back(b);
+                    b->mmap();
+                    total += sz;
+                } catch (...) { res = "FAIL"; }
+                GGML_LOG_INFO("ggml-hex: %s replay: map %zu MiB -> %s (mapped so far %zu MiB)\n", this->c_name(), sz, res, total);
+            }
+            for (auto b : bufs) { delete b; }
+        }
     }
     this->valid_iface = true;
 
@@ -8138,8 +8180,8 @@ static void ggml_hexagon_resolve_device_domain(ggml_hexagon_device_config & cfg,
 
 // Enumerate NPU (aka CDSP) domains via FASTRPC_GET_DOMAINS if supported,
 // and populate domain_id and domain_name for all configured devices.
-static void ggml_hexagon_discover_devices() {
-    std::unordered_map<int, fastrpc_domain> cdsp_map;
+// query the CDSP domains, returns true when the query is supported (cdsp_map has one entry per physical NPU)
+static bool ggml_hexagon_query_cdsp_domains(std::unordered_map<int, fastrpc_domain> & cdsp_map) {
     bool discovery_supported = false;
 
     system_req_payload domain_info = {};
@@ -8180,7 +8222,11 @@ static void ggml_hexagon_discover_devices() {
         GGML_LOG_DEBUG("ggml-hex: FASTRPC_GET_DOMAINS query failed (0x%x), using static CDSP domains\n", (unsigned) err);
     }
 
-    // Populate domain IDs and names for all configured devices
+    return discovery_supported;
+}
+
+// Populate domain IDs and names for all configured devices
+static void ggml_hexagon_discover_devices(const std::unordered_map<int, fastrpc_domain> & cdsp_map, bool discovery_supported) {
     for (size_t i = 0; i < opt_ndev; i++) {
         ggml_hexagon_resolve_device_domain(opt_device_configs[i], discovery_supported, cdsp_map);
     }
@@ -8275,6 +8321,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_ar_select = str_ar_select ? atoi(str_ar_select)                   : opt_ar_select;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
     opt_vmem      = str_vmem     ? strtoul(str_vmem, NULL, 0) * MiB       : opt_vmem;
+    if (str_vmem && opt_vmem == 0) {
+        opt_vmem_measure = true;
+        opt_vmem         = HTP_OP_MAX_VMEM_DEFAULT;
+    }
     opt_vmem_usable = str_vmem_usable ? strtoul(str_vmem_usable, NULL, 0) * MiB : opt_vmem_usable;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf) != 0                 : opt_hostbuf;
 
@@ -8298,7 +8348,25 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
         }
     };
 
-    if (str_devices && str_devices[0] != '\0' && strcmp(str_devices, "auto") != 0) {
+    // auto (also the default): one logical device per virtual session, each spanning all physical NPUs (row-split)
+    std::unordered_map<int, fastrpc_domain> cdsp_map;
+    const bool discovery_supported = ggml_hexagon_query_cdsp_domains(cdsp_map);
+    const size_t n_phys = discovery_supported && !cdsp_map.empty() ? cdsp_map.size() : 1;
+
+    std::string auto_devices;
+    if (!str_devices || str_devices[0] == '\0' || strcmp(str_devices, "auto") == 0 || strcmp(str_devices, "HTP") == 0) {
+        if (n_phys > 1) {
+            for (int v = 0; v < GGML_HEXAGON_MAX_VSESSIONS; v++) {
+                auto_devices += (v ? "," : "") + std::string("HTP") + std::to_string(v) + "[0-" + std::to_string(n_phys - 1) + ":" + std::to_string(v) + "]";
+            }
+            GGML_LOG_INFO("ggml-hex: %zu physical NPUs, auto devices : %s\n", n_phys, auto_devices.c_str());
+            str_devices = auto_devices.c_str();
+        } else {
+            str_devices = nullptr;
+        }
+    }
+
+    if (str_devices) {
         bool is_single_number = true;
         for (int i = 0; str_devices[i] != '\0'; i++) {
             if (!isdigit((unsigned char)str_devices[i])) {
@@ -8460,7 +8528,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
             }
         }
     } else {
-        // auto: expose the max virtual sessions, they are opened only when a model uses them (see --device auto)
+        // auto: expose the max virtual sessions, they are opened only when a model uses them (see --device HTP)
         set_virtual_devices(GGML_HEXAGON_MAX_VSESSIONS);
     }
 
@@ -8471,8 +8539,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     }
 #endif
 
-    // Resolve domain info for all configured devices
-    ggml_hexagon_discover_devices();
+    ggml_hexagon_discover_devices(cdsp_map, discovery_supported);
 
     if (str_profile) {
         opt_pmu_evt = [&]() -> std::vector<uint32_t> {
