@@ -292,13 +292,18 @@ static inline bool ggml_hexagon_is_hmx_weight_type(enum ggml_type type) {
 
 // F16, BF16 and F32 MUL_MAT weights are repacked too: F16 and BF16 into F16 tiles, F32 into F32 tiles.
 // Other ops also read these types, so only MUL_MAT weights are repacked: when the loader probe asks for them,
-// or in place on their first MUL_MAT query (see ggml_hexagon_repack_float_in_place).
+// or in place before their first MUL_MAT runs (see ggml_hexagon_repack_float_in_place).
 static inline bool ggml_hexagon_is_float_repack_type(enum ggml_type type) {
     return type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_F32;
 }
 
 static inline int ggml_hexagon_float_tiled_type(enum ggml_type type) {
     return type == GGML_TYPE_F32 ? HTP_TYPE_F32_TILED : HTP_TYPE_F16_TILED;
+}
+
+// Key of a float weight in the repack registry: names repeat across models loaded in one process (e.g. a draft model)
+static inline std::string ggml_hexagon_float_repack_key(const ggml_tensor * t) {
+    return std::string(t->name) + "|" + std::to_string(t->ne[0]) + "x" + std::to_string(t->ne[1]) + "|" + std::to_string(t->type);
 }
 
 // Type of the tensor data in the DSP buffer
@@ -520,8 +525,9 @@ struct ggml_hexagon_session {
     std::vector<htp_opnode> cached_nodes;
 
     mutable std::unordered_set<const ggml_tensor *> needs_repack;
-    // Float MUL_MAT weights to repack, by name: the loader probes a metadata copy, not the tensor it allocates later.
-    mutable std::unordered_set<std::string> float_repack_names;
+    // Float MUL_MAT weights to repack, by name, shape and type: the loader probes a metadata copy, not the tensor
+    // it allocates later (see ggml_hexagon_float_repack_key)
+    mutable std::unordered_set<std::string> float_repack_keys;
 
     ggml_hexagon_mdev_group                mdev;
     ggml_backend_dev_t                     dev       = nullptr;
@@ -824,7 +830,7 @@ static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buf
         }
     }
 
-    if (ggml_hexagon_is_float_repack_type(tensor->type) && !tensor->view_src && sess->float_repack_names.erase(tensor->name)) {
+    if (ggml_hexagon_is_float_repack_type(tensor->type) && !tensor->view_src && sess->float_repack_keys.erase(ggml_hexagon_float_repack_key(tensor))) {
         extra->flags |= GGML_HEXAGON_TENSOR_REPACK;
     }
 
@@ -2003,31 +2009,58 @@ static void repack_float_tiled(ggml_tensor * t, const void * data) {
     const int64_t ne1   = t->ne[1];
     const int64_t n_mat = t->ne[2] * t->ne[3];
 
+    const bool    f32_tile    = t->type == GGML_TYPE_F32;
+    const int64_t n_k_tiles   = ne0 / 32;
+    const int64_t n_col_tiles = hex_round_up(ne1, 32) / 32;
+    const size_t  tile_bytes  = (f32_tile ? sizeof(float) : sizeof(ggml_fp16_t)) * HTP_MM_HMX_TILE_N_ELMS;
+
     size_t n_sat = 0;
 
-    // zero the padding rows of the last column tile
-    const size_t esz = t->type == GGML_TYPE_F32 ? sizeof(float) : sizeof(ggml_fp16_t);
-    memset(t->data, 0, esz * ne0 * hex_round_up(ne1, 32) * n_mat);
-
+    // one tile at a time: strided reads of 32 source rows, sequential writes of the 2 or 4 KiB tile
     for (int64_t m = 0; m < n_mat; m++) {
-        for (int64_t r = 0; r < ne1; r++) {
-            const int64_t src_row = (m * ne1 + r) * ne0;
-            const int     row     = r % 32;
+        for (int64_t ct = 0; ct < n_col_tiles; ct++) {
+            const int n_rows = (int) std::min<int64_t>(32, ne1 - ct * 32);
 
-            for (int64_t k = 0; k < ne0; k++) {
-                const size_t di = hex_float_tile_base(t, m, r, k) + hex_float_tile_index(t->type == GGML_TYPE_F32, row, k % 32);
-                switch (t->type) {
-                    case GGML_TYPE_F16:
-                        ((ggml_fp16_t *) t->data)[di] = ((const ggml_fp16_t *) data)[src_row + k];
-                        break;
-                    case GGML_TYPE_BF16:
-                        ((ggml_fp16_t *) t->data)[di] = hex_bf16_to_fp16_sat(((const ggml_bf16_t *) data)[src_row + k], &n_sat);
-                        break;
-                    case GGML_TYPE_F32:
-                        ((float *) t->data)[di] = ((const float *) data)[src_row + k];
-                        break;
-                    default:
-                        GGML_ABORT("ggml-hex: unexpected float repack type");
+            for (int64_t kt = 0; kt < n_k_tiles; kt++) {
+                uint8_t * tile = (uint8_t *) t->data + ((m * n_col_tiles + ct) * n_k_tiles + kt) * tile_bytes;
+                if (n_rows < 32) {
+                    memset(tile, 0, tile_bytes); // padding rows
+                }
+
+                for (int row = 0; row < n_rows; row++) {
+                    const int64_t src_row = (m * ne1 + ct * 32 + row) * ne0 + kt * 32;
+
+                    switch (t->type) {
+                        case GGML_TYPE_F16: {
+                            // pairs (k, k+1) of a row are one 32-bit word in both layouts
+                            const uint32_t * src = (const uint32_t *) ((const ggml_fp16_t *) data + src_row);
+                            uint32_t * dst = (uint32_t *) tile;
+                            for (int cp = 0; cp < 16; cp++) {
+                                dst[cp * 32 + row] = src[cp];
+                            }
+                            break;
+                        }
+                        case GGML_TYPE_BF16: {
+                            const ggml_bf16_t * src = (const ggml_bf16_t *) data + src_row;
+                            uint32_t * dst = (uint32_t *) tile;
+                            for (int cp = 0; cp < 16; cp++) {
+                                const uint32_t lo = hex_bf16_to_fp16_sat(src[2 * cp + 0], &n_sat);
+                                const uint32_t hi = hex_bf16_to_fp16_sat(src[2 * cp + 1], &n_sat);
+                                dst[cp * 32 + row] = lo | (hi << 16);
+                            }
+                            break;
+                        }
+                        case GGML_TYPE_F32: {
+                            const float * src = (const float *) data + src_row;
+                            float * dst = (float *) tile;
+                            for (int k = 0; k < 32; k++) {
+                                dst[k * 32 + row] = src[k];
+                            }
+                            break;
+                        }
+                        default:
+                            GGML_ABORT("ggml-hex: unexpected float repack type");
+                    }
                 }
             }
         }
@@ -2491,7 +2524,7 @@ static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffe
             is_repack = (((const ggml_hexagon_tensor_extra *) t->extra)->flags & GGML_HEXAGON_TENSOR_REPACK) != 0;
         } else {
             auto dev_ctx = static_cast<ggml_backend_hexagon_buffer_type_context *>(buft->context)->dev_ctx;
-            is_repack = dev_ctx->session()->float_repack_names.count(t->name) != 0;
+            is_repack = dev_ctx->session()->float_repack_keys.count(ggml_hexagon_float_repack_key(t)) != 0;
         }
         if (is_repack) {
             return ggml_row_size(t->type, t->ne[0]) * hex_round_up(t->ne[1], 32) * t->ne[2] * t->ne[3];
@@ -4780,50 +4813,55 @@ static bool ggml_hexagon_is_weight_probe(const struct ggml_tensor * t) {
     return t->buffer && !t->extra && ggml_backend_buffer_get_size(t->buffer) == 0 && ggml_backend_buffer_is_hexagon(t->buffer);
 }
 
-// A float weight is repacked when its extra says so, or, during the loader probe, when the probe marked it.
-static bool ggml_hexagon_is_float_repacked(const struct ggml_hexagon_session * sess, const struct ggml_tensor * t) {
-    if (!ggml_hexagon_is_float_repack_type(t->type) || !t->buffer || !ggml_backend_buffer_is_hexagon(t->buffer)) {
-        return false;
-    }
-    if (t->extra) {
-        return (((const ggml_hexagon_tensor_extra *) t->extra)->flags & GGML_HEXAGON_TENSOR_REPACK) != 0;
-    }
-    return sess && ggml_hexagon_is_weight_probe(t) && sess->float_repack_names.count(t->name) != 0;
-}
-
-// Weight type as the matmul kernels see it: the tiled type for repacked F16/BF16/F32 weights.
-static int ggml_hexagon_mm_weight_type(const struct ggml_hexagon_session * sess, const struct ggml_tensor * src0) {
-    if (ggml_hexagon_is_float_repacked(sess, src0)) {
-        return ggml_hexagon_float_tiled_type(src0->type);
-    }
-    return src0->type;
-}
-
 // Float weights are repacked as whole 2D matrices, k must fill the tiles.
 static bool ggml_hexagon_can_repack_float(const struct ggml_tensor * t) {
     return ggml_is_contiguous(t) && !ggml_is_permuted(t) && !t->view_src &&
            t->ne[0] % 32 == 0 && t->ne[2] == 1 && t->ne[3] == 1;
 }
 
-// Weights loaded without the per-tensor probe (e.g. the mtmd projector) are repacked in place on their first
-// MUL_MAT query. In place means no room for padding, so the rows must fill the tiles.
-static bool ggml_hexagon_repack_float_in_place(const struct ggml_tensor * t) {
+// Weights loaded without the per-tensor probe (e.g. the mtmd projector) are repacked in place before their first
+// MUL_MAT runs. In place means no room for padding, so the rows must fill the tiles.
+static bool ggml_hexagon_float_repack_pending(const struct ggml_tensor * t) {
     if (!ggml_hexagon_is_float_repack_type(t->type) || !t->buffer || !t->extra || !t->data ||
         !ggml_backend_buffer_is_hexagon(t->buffer) ||
         ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
         !ggml_hexagon_can_repack_float(t) || t->ne[1] % 32 != 0) {
         return false;
     }
+    return (((const ggml_hexagon_tensor_extra *) t->extra)->flags & GGML_HEXAGON_TENSOR_REPACK) == 0;
+}
 
-    auto extra = (ggml_hexagon_tensor_extra *) t->extra;
-    if (extra->flags & GGML_HEXAGON_TENSOR_REPACK) {
-        return true;
+// A float weight is in tiles (or will be before it is used) when its extra says so, when the loader probe marked it,
+// or when it is a MUL_MAT weight loaded without the probe.
+static bool ggml_hexagon_float_is_tiled(const struct ggml_hexagon_session * sess, const struct ggml_tensor * t) {
+    if (!ggml_hexagon_is_float_repack_type(t->type) || !t->buffer || !ggml_backend_buffer_is_hexagon(t->buffer)) {
+        return false;
     }
+    if (t->extra) {
+        return (((const ggml_hexagon_tensor_extra *) t->extra)->flags & GGML_HEXAGON_TENSOR_REPACK) != 0 ||
+               ggml_hexagon_float_repack_pending(t);
+    }
+    return sess && ggml_hexagon_is_weight_probe(t) && sess->float_repack_keys.count(ggml_hexagon_float_repack_key(t)) != 0;
+}
 
+// Weight type as the matmul kernels see it: the tiled type for repacked F16/BF16/F32 weights.
+static int ggml_hexagon_mm_weight_type(const struct ggml_hexagon_session * sess, const struct ggml_tensor * src0) {
+    if (ggml_hexagon_float_is_tiled(sess, src0)) {
+        return ggml_hexagon_float_tiled_type(src0->type);
+    }
+    return src0->type;
+}
+
+// Called from graph_compute for the weight of a MUL_MAT node, before the op is prepared.
+static void ggml_hexagon_repack_float_in_place(struct ggml_tensor * t) {
+    if (!ggml_hexagon_float_repack_pending(t)) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
     std::vector<uint8_t> data((const uint8_t *) t->data, (const uint8_t *) t->data + ggml_nbytes(t));
-    repack_float_tiled((ggml_tensor *) t, data.data());
-    extra->flags |= GGML_HEXAGON_TENSOR_REPACK;
-    return true;
+    repack_float_tiled(t, data.data());
+    ((ggml_hexagon_tensor_extra *) t->extra)->flags |= GGML_HEXAGON_TENSOR_REPACK;
+    HEX_VERBOSE("ggml-hex: repack in place %s : %zu bytes in %.1f ms\n", t->name, ggml_nbytes(t), (ggml_time_us() - t0) / 1000.0);
 }
 
 static bool ggml_hexagon_matmul_is_hmx_eligible(
@@ -5974,17 +6012,15 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
                 return false;
             }
             // views of repacked weights do not see the ggml layout
-            if (src0->view_src && ggml_hexagon_is_float_repacked(sess, src0->view_src)) {
+            if (src0->view_src && ggml_hexagon_float_is_tiled(sess, src0->view_src)) {
                 return false;
             }
             if (ggml_hexagon_is_weight_probe(src0) && ggml_hexagon_can_repack_float(src0)) {
-                sess->float_repack_names.insert(src0->name);
+                sess->float_repack_keys.insert(ggml_hexagon_float_repack_key(src0));
                 probe_repack = true;
-            } else if (!ggml_hexagon_is_float_repacked(sess, src0)) {
-                ggml_hexagon_repack_float_in_place(src0);
             }
             // no BF16 kernels: BF16 weights are converted to F16 tiles by the repack
-            if (src0->type == GGML_TYPE_BF16 && !ggml_hexagon_is_float_repacked(sess, src0)) {
+            if (src0->type == GGML_TYPE_BF16 && !ggml_hexagon_float_is_tiled(sess, src0)) {
                 return false;
             }
             break;
@@ -5998,7 +6034,7 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
     if (kparams.kernel_type == HTP_MM_KERNEL_UNSUPPORTED || (size_t) kparams.vtcm_size > sess->vtcm_size) {
         HEX_VERBOSE("ggml-hex: %s supported MUL_MAT VTCM size needed (%d) > budget (%zu)\n", sess->c_name(), kparams.vtcm_size, sess->vtcm_size);
         if (probe_repack) {
-            sess->float_repack_names.erase(src0->name);  // the weight goes elsewhere
+            sess->float_repack_keys.erase(ggml_hexagon_float_repack_key(src0));  // the weight goes elsewhere
         }
         return false;
     }
@@ -7023,6 +7059,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
             htp_opnode node(HTP_OP_INVALID, n);
             node.opcode = op_remap_to_htp(n);
             if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID) {
+                ggml_hexagon_repack_float_in_place(n->src[0]);
                 ggml_hexagon_precompute_matmul_params(sess,
                     node.node->src[0], node.node->src[1], node.node,
                     (struct htp_mm_kernel_params *)node.kernel_params
@@ -7846,7 +7883,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
     if (op->op != GGML_OP_MUL_MAT && !ggml_op_is_empty(op->op)) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             const ggml_tensor * src = op->src[i];
-            if (src && ggml_hexagon_is_float_repacked(sess, src->view_src ? src->view_src : src)) {
+            if (src && ggml_hexagon_float_is_tiled(sess, src->view_src ? src->view_src : src)) {
                 return false;
             }
         }
