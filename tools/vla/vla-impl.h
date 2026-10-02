@@ -52,6 +52,8 @@ struct vla_hparams {
 
     int32_t n_patches() const { return (v_image_size / v_patch_size) * (v_image_size / v_patch_size); }
     int32_t n_img_tokens() const { return n_patches() / (v_scale_factor * v_scale_factor); }
+    bool expert_self_attn(int il) const { return e_self_attn_every_n > 0 && il % e_self_attn_every_n == 0; }
+
     // images, padded language, state
     int32_t n_prefix() const { return n_img_tokens() * n_cameras + max_lang_tokens + 1; }
 };
@@ -139,6 +141,15 @@ struct vla_graph_inputs {
     ggml_tensor * state   = nullptr; // [max_state_dim], normalized and zero padded
     ggml_tensor * pos     = nullptr; // [n_prefix]
     ggml_tensor * mask    = nullptr; // [n_prefix, n_prefix], 0 or -inf
+
+    ggml_tensor * noise      = nullptr; // [max_action_dim, chunk_size]
+    ggml_tensor * time_emb   = nullptr; // [e_n_embd, num_steps]
+    ggml_tensor * pos_self   = nullptr; // [chunk_size], after the prefix
+    ggml_tensor * pos_cross  = nullptr; // [chunk_size], from 0
+    ggml_tensor * mask_self  = nullptr; // [n_prefix + chunk_size, chunk_size]
+    ggml_tensor * mask_cross = nullptr; // [n_prefix, chunk_size]
+
+    ggml_tensor * actions = nullptr;    // [max_action_dim, chunk_size], normalized
 };
 
 struct vla_context {

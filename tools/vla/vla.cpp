@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fstream>
 #include <initializer_list>
+#include <random>
 #include <stdexcept>
 #include <string>
 
@@ -160,7 +161,7 @@ static void vla_load_hparams(vla_loader & ml, vla_hparams & hp) {
     if (hp.v_image_size % hp.v_patch_size != 0 || grid % hp.v_scale_factor != 0 || hp.v_n_embd % hp.v_n_head != 0) {
         throw std::runtime_error("inconsistent vision hparams");
     }
-    if (hp.t_n_head % hp.t_n_head_kv != 0 || hp.e_n_layer != hp.t_n_layer || hp.state_dim > hp.max_state_dim
+    if (hp.t_n_head % hp.t_n_head_kv != 0 || hp.t_head_dim % 2 != 0 || hp.e_n_embd % 2 != 0 || hp.e_n_layer != hp.t_n_layer || hp.state_dim > hp.max_state_dim
             || hp.action_dim > hp.max_action_dim) {
         throw std::runtime_error("inconsistent policy hparams");
     }
@@ -226,6 +227,35 @@ static void vla_load_tensors(vla_loader & ml, vla_context & ctx) {
         l.up        = ml.get(cd, name("ffn_up.weight"), {td, hp.t_n_ff});
         l.down      = ml.get(cd, name("ffn_down.weight"), {hp.t_n_ff, td});
     }
+
+    const int64_t ed  = hp.e_n_embd;
+    const int64_t kvd = hp.t_n_head_kv * hd;
+    m.exp.resize(hp.e_n_layer);
+    for (int il = 0; il < hp.e_n_layer; il++) {
+        auto & l = m.exp[il];
+        auto name = [&](const char * t) { return format("exp.blk.%d.%s", il, t); };
+        // cross-attention layers project the VLM K/V, not the expert hidden state
+        const int64_t kv_in = hp.expert_self_attn(il) ? ed : kvd;
+        l.attn_norm = ml.get(cd, name("attn_norm.weight"), {ed});
+        l.q         = ml.get(cd, name("attn_q.weight"), {ed, hp.t_n_head * hd});
+        l.k         = ml.get(cd, name("attn_k.weight"), {kv_in, kvd});
+        l.v         = ml.get(cd, name("attn_v.weight"), {kv_in, kvd});
+        l.o         = ml.get(cd, name("attn_output.weight"), {hp.t_n_head * hd, ed});
+        l.ffn_norm  = ml.get(cd, name("ffn_norm.weight"), {ed});
+        l.gate      = ml.get(cd, name("ffn_gate.weight"), {ed, hp.e_n_ff});
+        l.up        = ml.get(cd, name("ffn_up.weight"), {ed, hp.e_n_ff});
+        l.down      = ml.get(cd, name("ffn_down.weight"), {hp.e_n_ff, ed});
+    }
+    m.exp_out_norm = ml.get(cd, "exp.output_norm.weight", {ed});
+
+    m.act_in_w   = ml.get(cd, "act.in_proj.weight", {hp.max_action_dim, ed});
+    m.act_in_b   = ml.get(cd, "act.in_proj.bias", {ed});
+    m.act_out_w  = ml.get(cd, "act.out_proj.weight", {ed, hp.max_action_dim});
+    m.act_out_b  = ml.get(cd, "act.out_proj.bias", {hp.max_action_dim});
+    m.time_in_w  = ml.get(cd, "act.time_mlp_in.weight", {2 * ed, ed});
+    m.time_in_b  = ml.get(cd, "act.time_mlp_in.bias", {ed});
+    m.time_out_w = ml.get(cd, "act.time_mlp_out.weight", {ed, ed});
+    m.time_out_b = ml.get(cd, "act.time_mlp_out.bias", {ed});
 }
 
 //
@@ -482,6 +512,67 @@ static void vla_set_prefix(const vla_context & ctx, const vla_input & in) {
     ggml_backend_tensor_set(ctx.inp.mask, mask.data(), 0, mask.size() * sizeof(float));
 }
 
+// suffix = chunk_size action tokens: causal among themselves, they see the valid prefix
+static void vla_set_suffix(const vla_context & ctx, const vla_input & in) {
+    const vla_hparams & hp = ctx.model.hparams;
+    const int32_t n_img    = hp.n_img_tokens() * hp.n_cameras;
+    const int32_t n_prefix = hp.n_prefix();
+    const int32_t chunk    = hp.chunk_size;
+    const int32_t n_valid  = n_img + in.n_tokens + 1;
+
+    std::vector<float> noise((size_t) hp.max_action_dim * chunk);
+    if (in.noise) {
+        memcpy(noise.data(), in.noise, noise.size() * sizeof(float));
+    } else {
+        std::mt19937 rng(in.seed);
+        std::normal_distribution<float> dist(0.0f, 1.0f);
+        for (float & v : noise) {
+            v = dist(rng);
+        }
+    }
+
+    // openpi sinusoidal embedding: float32 time, float64 sin/cos over log-spaced periods
+    const int32_t half = hp.e_n_embd / 2;
+    std::vector<float> time_emb((size_t) hp.e_n_embd * hp.num_steps);
+    for (int s = 0; s < hp.num_steps; s++) {
+        const double dt = -1.0 / hp.num_steps;
+        const double t  = (float) (1.0 + s * dt);
+        for (int i = 0; i < half; i++) {
+            const double frac   = half > 1 ? (double) i / (half - 1) : 0.0;
+            const double period = hp.time_min_period * std::pow((double) hp.time_max_period / hp.time_min_period, frac);
+            const double x      = t * 2.0 * M_PI / period;
+            time_emb[(size_t) s * hp.e_n_embd + i]        = (float) std::sin(x);
+            time_emb[(size_t) s * hp.e_n_embd + half + i] = (float) std::cos(x);
+        }
+    }
+
+    std::vector<int32_t> pos_self(chunk), pos_cross(chunk);
+    for (int i = 0; i < chunk; i++) {
+        pos_self[i]  = n_valid + i;
+        pos_cross[i] = i;
+    }
+
+    std::vector<float> mask_self((size_t) (n_prefix + chunk) * chunk);
+    std::vector<float> mask_cross((size_t) n_prefix * chunk);
+    for (int q = 0; q < chunk; q++) {
+        for (int k = 0; k < n_prefix; k++) {
+            const bool valid = k < n_img + in.n_tokens || k == n_prefix - 1;
+            mask_self [(size_t) q * (n_prefix + chunk) + k] = valid ? 0.0f : -INFINITY;
+            mask_cross[(size_t) q * n_prefix + k]           = valid ? 0.0f : -INFINITY;
+        }
+        for (int k = 0; k < chunk; k++) {
+            mask_self[(size_t) q * (n_prefix + chunk) + n_prefix + k] = k <= q ? 0.0f : -INFINITY;
+        }
+    }
+
+    ggml_backend_tensor_set(ctx.inp.noise, noise.data(), 0, noise.size() * sizeof(float));
+    ggml_backend_tensor_set(ctx.inp.time_emb, time_emb.data(), 0, time_emb.size() * sizeof(float));
+    ggml_backend_tensor_set(ctx.inp.pos_self, pos_self.data(), 0, pos_self.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(ctx.inp.pos_cross, pos_cross.data(), 0, pos_cross.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(ctx.inp.mask_self, mask_self.data(), 0, mask_self.size() * sizeof(float));
+    ggml_backend_tensor_set(ctx.inp.mask_cross, mask_cross.data(), 0, mask_cross.size() * sizeof(float));
+}
+
 int32_t vla_predict(vla_context * ctx, const vla_input * in, float * actions) {
     const vla_hparams & hp = ctx->model.hparams;
     if (in->n_images != hp.n_cameras || in->n_state != hp.state_dim || in->n_tokens < 1 || in->n_tokens > hp.max_lang_tokens) {
@@ -512,11 +603,20 @@ int32_t vla_predict(vla_context * ctx, const vla_input * in, float * actions) {
     }
     vla_set_patches(*ctx, *in);
     vla_set_prefix(*ctx, *in);
+    vla_set_suffix(*ctx, *in);
 
     if (ggml_backend_sched_graph_compute(ctx->sched.get(), gf) != GGML_STATUS_SUCCESS) {
         VLA_LOG_ERR("%s: graph compute failed\n", __func__);
         return 2;
     }
-    GGML_UNUSED(actions);
+
+    const vla_model & m = ctx->model;
+    std::vector<float> out((size_t) hp.max_action_dim * hp.chunk_size);
+    ggml_backend_tensor_get(ctx->inp.actions, out.data(), 0, out.size() * sizeof(float));
+    for (int i = 0; i < hp.chunk_size; i++) {
+        for (int j = 0; j < hp.action_dim; j++) {
+            actions[i * hp.action_dim + j] = out[(size_t) i * hp.max_action_dim + j] * (m.action_std[j] + hp.norm_eps) + m.action_mean[j];
+        }
+    }
     return 0;
 }

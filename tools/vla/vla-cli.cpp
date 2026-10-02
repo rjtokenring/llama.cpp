@@ -12,7 +12,9 @@
 #include <vector>
 
 // runs a policy over recorded samples:
-//   llama-vla-cli -m policy.gguf --samples file.bin [--noise noise.f32] [--dump dir] [-t N] [--device NAME] [-fa]
+//   llama-vla-cli -m policy.gguf --samples file.bin [--noise noise.f32] [--out actions.bin] [--dump dir] [-t N] [--device NAME] [-fa]
+//
+// actions file: i32 n_samples, i32 chunk_size * action_dim, then the f32 actions of each sample
 //
 // samples file, little-endian: "VLAR" i32 version=1, n_samples, n_images, width, height, state_dim, pixel_format
 // then per sample: i32 n_tok, i32 tok[n_tok], f32 state[state_dim], images as u8 (pixel_format 0) or f32 (1) RGB
@@ -66,12 +68,12 @@ static bool dump_cb(ggml_tensor * t, bool ask, void * user_data) {
 }
 
 static void usage(const char * argv0) {
-    fprintf(stderr, "usage: %s -m policy.gguf --samples file.bin [--noise noise.f32] [--dump dir [--dump-names a,b]] [-t N] [--device NAME] [-fa]\n", argv0);
+    fprintf(stderr, "usage: %s -m policy.gguf --samples file.bin [--noise noise.f32] [--out actions.bin] [--dump dir [--dump-names a,b]] [-t N] [--device NAME] [-fa]\n", argv0);
     exit(1);
 }
 
 int main(int argc, char ** argv) {
-    std::string model_path, samples_path, noise_path;
+    std::string model_path, samples_path, noise_path, out_path;
     dump_state dump;
     vla_context_params params = vla_context_default_params();
 
@@ -89,6 +91,8 @@ int main(int argc, char ** argv) {
             samples_path = next();
         } else if (a == "--noise") {
             noise_path = next();
+        } else if (a == "--out") {
+            out_path = next();
         } else if (a == "--dump") {
             dump.dir = next();
         } else if (a == "--dump-names") {
@@ -149,6 +153,15 @@ int main(int argc, char ** argv) {
     }
 
     std::vector<float> actions((size_t) info.chunk_size * info.action_dim);
+    FILE * fout = nullptr;
+    if (!out_path.empty()) {
+        fout = fopen(out_path.c_str(), "wb");
+        const int32_t ohdr[2] = { n_samples, (int32_t) actions.size() };
+        if (!fout || fwrite(ohdr, sizeof(ohdr), 1, fout) != 1) {
+            fprintf(stderr, "cannot write %s\n", out_path.c_str());
+            return 1;
+        }
+    }
     for (int32_t s = 0; s < n_samples; s++) {
         int32_t n_tok = 0;
         fin.read((char *) &n_tok, sizeof(n_tok));
@@ -184,7 +197,17 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "sample %d: predict failed\n", s);
             return 1;
         }
-        printf("sample %d: ok\n", s);
+        printf("sample %d: actions[0] =", s);
+        for (int j = 0; j < info.action_dim; j++) {
+            printf(" %.4f", actions[j]);
+        }
+        printf("\n");
+        if (fout) {
+            fwrite(actions.data(), sizeof(float), actions.size(), fout);
+        }
+    }
+    if (fout) {
+        fclose(fout);
     }
 
     vla_free(ctx);

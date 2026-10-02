@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare llama-vla-cli --dump tensors with smolvla_oracle.py outputs.
 
-    compare.py --oracle oracle/ --dump dump/ [--samples 3]
+    compare.py --oracle oracle/ --dump dump/ [--actions actions.bin] [--samples 3]
 """
 
 import argparse
@@ -19,6 +19,8 @@ PROBES = {
     "Vcur-0":     "v_0",
     "Kcur-last":  "k_last",
     "Vcur-last":  "v_last",
+    "v_t-0":      "v_t_0",
+    "actions_norm": "actions_norm",
 }
 
 
@@ -33,8 +35,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--oracle", required=True)
     ap.add_argument("--dump", required=True)
+    ap.add_argument("--actions", help="llama-vla-cli --out file, compared with the oracle actions")
     ap.add_argument("--samples", type=int, default=3)
     a = ap.parse_args()
+
+    acts = None
+    if a.actions:
+        with open(a.actions, "rb") as f:
+            n, size = np.frombuffer(f.read(8), "<i4")
+            acts = np.frombuffer(f.read(), "<f4").reshape(n, size)
 
     print(f"{'sample':>6} {'probe':<14} {'max|d|':>10} {'rel rms':>10} {'max|ref|':>10}")
     for i in range(a.samples):
@@ -54,6 +63,11 @@ def main():
             d = got - want
             rel = np.sqrt((d ** 2).mean() / (want ** 2).mean())
             print(f"{i:>6} {dname:<14} {np.abs(d).max():>10.3e} {rel:>10.3e} {np.abs(want).max():>10.3e}")
+        if acts is not None:
+            want = ref["actions"]
+            d = acts[i].reshape(want.shape) - want
+            rel = np.sqrt((d ** 2).mean() / (want ** 2).mean())
+            print(f"{i:>6} {'actions':<14} {np.abs(d).max():>10.3e} {rel:>10.3e} {np.abs(want).max():>10.3e}")
 
 
 if __name__ == "__main__":
