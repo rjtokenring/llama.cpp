@@ -52,6 +52,8 @@ struct vla_hparams {
 
     int32_t n_patches() const { return (v_image_size / v_patch_size) * (v_image_size / v_patch_size); }
     int32_t n_img_tokens() const { return n_patches() / (v_scale_factor * v_scale_factor); }
+    // images, padded language, state
+    int32_t n_prefix() const { return n_img_tokens() * n_cameras + max_lang_tokens + 1; }
 };
 
 struct vla_vit_layer {
@@ -96,6 +98,7 @@ struct vla_model {
     ggml_tensor * post_ln_b = nullptr;
     ggml_tensor * mm_fc = nullptr;
 
+    int32_t       n_vocab  = 0;
     ggml_tensor * tok_embd = nullptr;
     std::vector<vla_lm_layer> vlm;
     std::vector<vla_lm_layer> exp;
@@ -132,6 +135,10 @@ using vla_sched_ptr    = std::unique_ptr<ggml_backend_sched, vla_sched_deleter>;
 // tensors the graph reads per call; filled by vla_predict() after allocation
 struct vla_graph_inputs {
     ggml_tensor * patches = nullptr; // [patch_size * patch_size * 3, n_patches, n_cameras], pixels in [-1, 1]
+    ggml_tensor * tokens  = nullptr; // [max_lang_tokens], padded
+    ggml_tensor * state   = nullptr; // [max_state_dim], normalized and zero padded
+    ggml_tensor * pos     = nullptr; // [n_prefix]
+    ggml_tensor * mask    = nullptr; // [n_prefix, n_prefix], 0 or -inf
 };
 
 struct vla_context {

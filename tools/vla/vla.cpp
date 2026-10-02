@@ -3,6 +3,7 @@
 #include "ggml-cpu.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -199,6 +200,32 @@ static void vla_load_tensors(vla_loader & ml, vla_context & ctx) {
         l.down_b = ml.get(cd, name("ffn_down.bias"), {vd});
     }
     m.mm_fc = ml.get(cd, "mm.model.fc.weight", {vd * hp.v_scale_factor * hp.v_scale_factor, hp.t_n_embd});
+
+    const int64_t td = hp.t_n_embd;
+    const int64_t hd = hp.t_head_dim;
+    ggml_tensor * tok_meta = ggml_get_tensor(ml.meta, "token_embd.weight");
+    if (!tok_meta || tok_meta->ne[1] < 1 || tok_meta->ne[1] > (1 << 24)) {
+        throw std::runtime_error("missing or malformed token_embd.weight");
+    }
+    m.n_vocab  = (int32_t) tok_meta->ne[1];
+    // only read by GET_ROWS, keep it on the host
+    m.tok_embd = ml.get(ctx.ctx_w_cpu.get(), "token_embd.weight", {td, m.n_vocab});
+    m.state_proj_w = ml.get(cd, "state_proj.weight", {hp.max_state_dim, td});
+    m.state_proj_b = ml.get(cd, "state_proj.bias", {td});
+    m.vlm.resize(hp.t_n_layer);
+    for (int il = 0; il < hp.t_n_layer; il++) {
+        auto & l = m.vlm[il];
+        auto name = [&](const char * t) { return format("blk.%d.%s", il, t); };
+        l.attn_norm = ml.get(cd, name("attn_norm.weight"), {td});
+        l.q         = ml.get(cd, name("attn_q.weight"), {td, hp.t_n_head * hd});
+        l.k         = ml.get(cd, name("attn_k.weight"), {td, hp.t_n_head_kv * hd});
+        l.v         = ml.get(cd, name("attn_v.weight"), {td, hp.t_n_head_kv * hd});
+        l.o         = ml.get(cd, name("attn_output.weight"), {hp.t_n_head * hd, td});
+        l.ffn_norm  = ml.get(cd, name("ffn_norm.weight"), {td});
+        l.gate      = ml.get(cd, name("ffn_gate.weight"), {td, hp.t_n_ff});
+        l.up        = ml.get(cd, name("ffn_up.weight"), {td, hp.t_n_ff});
+        l.down      = ml.get(cd, name("ffn_down.weight"), {hp.t_n_ff, td});
+    }
 }
 
 //
@@ -306,6 +333,12 @@ static void vla_load(vla_context & ctx, const char * path) {
         ggml_backend_tensor_set(dst, read_buf.data(), 0, n);
     }
 
+    vla_model & m = ctx.model;
+    m.state_mean  = ml.get_f32_vec("norm.state_mean", m.hparams.state_dim, fin);
+    m.state_std   = ml.get_f32_vec("norm.state_std", m.hparams.state_dim, fin);
+    m.action_mean = ml.get_f32_vec("norm.action_mean", m.hparams.action_dim, fin);
+    m.action_std  = ml.get_f32_vec("norm.action_std", m.hparams.action_dim, fin);
+
     ctx.n_graph = vla_graph_size(ctx.model.hparams);
     ctx.compute_meta.resize(ggml_tensor_overhead() * ctx.n_graph + ggml_graph_overhead_custom(ctx.n_graph, false));
     ctx.sched.reset(ggml_backend_sched_new(ctx.backends.data(), nullptr, ctx.backends.size(), ctx.n_graph, false, true));
@@ -406,11 +439,60 @@ static void vla_set_patches(const vla_context & ctx, const vla_input & in) {
     ggml_backend_tensor_set(ctx.inp.patches, patches.data(), 0, patches.size() * sizeof(float));
 }
 
+// prefix = [images, language padded to max_lang_tokens, state]
+// LeRobot attention rule: images and language see each other, the state token sees everything, padding is never a key
+static void vla_set_prefix(const vla_context & ctx, const vla_input & in) {
+    const vla_model & m = ctx.model;
+    const vla_hparams & hp = m.hparams;
+    const int32_t n_img    = hp.n_img_tokens() * hp.n_cameras;
+    const int32_t n_prefix = hp.n_prefix();
+
+    std::vector<int32_t> tokens(hp.max_lang_tokens, 0);
+    memcpy(tokens.data(), in.tokens, in.n_tokens * sizeof(int32_t));
+
+    std::vector<float> state(hp.max_state_dim, 0.0f);
+    for (int i = 0; i < hp.state_dim; i++) {
+        state[i] = (in.state[i] - m.state_mean[i]) / (m.state_std[i] + hp.norm_eps);
+    }
+
+    std::vector<uint8_t> valid(n_prefix, 1);
+    std::vector<int32_t> block(n_prefix, 0);
+    for (int i = n_img + in.n_tokens; i < n_img + hp.max_lang_tokens; i++) {
+        valid[i] = 0;
+    }
+    block[n_prefix - 1] = 1;
+
+    std::vector<int32_t> pos(n_prefix);
+    for (int i = 0, p = -1; i < n_prefix; i++) {
+        p += valid[i];
+        pos[i] = std::max(p, 0);
+    }
+
+    // padded queries are never read; let them see the valid keys so no row is all -inf
+    std::vector<float> mask((size_t) n_prefix * n_prefix);
+    for (int q = 0; q < n_prefix; q++) {
+        for (int k = 0; k < n_prefix; k++) {
+            mask[(size_t) q * n_prefix + k] = valid[k] && block[k] <= block[q] ? 0.0f : -INFINITY;
+        }
+    }
+
+    ggml_backend_tensor_set(ctx.inp.tokens, tokens.data(), 0, tokens.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(ctx.inp.state, state.data(), 0, state.size() * sizeof(float));
+    ggml_backend_tensor_set(ctx.inp.pos, pos.data(), 0, pos.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(ctx.inp.mask, mask.data(), 0, mask.size() * sizeof(float));
+}
+
 int32_t vla_predict(vla_context * ctx, const vla_input * in, float * actions) {
     const vla_hparams & hp = ctx->model.hparams;
     if (in->n_images != hp.n_cameras || in->n_state != hp.state_dim || in->n_tokens < 1 || in->n_tokens > hp.max_lang_tokens) {
         VLA_LOG_ERR("%s: expected %d images, %d state values and 1..%d tokens\n", __func__, hp.n_cameras, hp.state_dim, hp.max_lang_tokens);
         return 1;
+    }
+    for (int i = 0; i < in->n_tokens; i++) {
+        if (in->tokens[i] < 0 || in->tokens[i] >= ctx->model.n_vocab) {
+            VLA_LOG_ERR("%s: token %d out of range\n", __func__, in->tokens[i]);
+            return 1;
+        }
     }
     for (int i = 0; i < in->n_images; i++) {
         if (in->images[i].nx != hp.v_image_size || in->images[i].ny != hp.v_image_size) {
@@ -429,6 +511,7 @@ int32_t vla_predict(vla_context * ctx, const vla_input * in, float * actions) {
         return 2;
     }
     vla_set_patches(*ctx, *in);
+    vla_set_prefix(*ctx, *in);
 
     if (ggml_backend_sched_graph_compute(ctx->sched.get(), gf) != GGML_STATUS_SUCCESS) {
         VLA_LOG_ERR("%s: graph compute failed\n", __func__);
