@@ -164,6 +164,7 @@ enum llm_arch {
     LLM_ARCH_POCKETTTS,
     LLM_ARCH_MINIMAX_01,
     LLM_ARCH_HRM_TEXT,
+    LLM_ARCH_VLA,
     LLM_ARCH_UNKNOWN,
 };
 

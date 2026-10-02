@@ -44,6 +44,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
     switch (arch) {
         case LLM_ARCH_CLIP:
             return new llama_model_clip(params);
+        case LLM_ARCH_VLA:
+            return new llama_model_vla(params);
         case LLM_ARCH_LLAMA:
             return new llama_model_llama(params);
         case LLM_ARCH_LLAMA4:
@@ -1313,8 +1315,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_GENERAL_NAME, name, false);
 
     // everything past this point is not vocab-related
-    // for CLIP models, we only need to load tensors, no hparams
-    if (hparams.vocab_only || ml.get_arch() == LLM_ARCH_CLIP) {
+    // for CLIP and VLA models, we only need to load tensors (quantize) or the vocab, no hparams
+    if (hparams.vocab_only || ml.get_arch() == LLM_ARCH_CLIP || ml.get_arch() == LLM_ARCH_VLA) {
         return;
     }
 
@@ -3033,6 +3035,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
     switch (model->arch) {
         // these models do not use RoPE
         case LLM_ARCH_CLIP:
+        case LLM_ARCH_VLA:
         case LLM_ARCH_GPT2:
         case LLM_ARCH_GPTJ:
         case LLM_ARCH_MPT:

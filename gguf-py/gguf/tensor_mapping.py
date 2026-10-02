@@ -180,6 +180,30 @@ class TensorNameMap:
         MODEL_TENSOR.A_QF_PROJ_LINEAR: (
             "projector.linear",
         ),
+
+        MODEL_TENSOR.VLA_STATE_PROJ: (
+            "model.state_proj", # smolvla
+        ),
+
+        MODEL_TENSOR.VLA_ACT_IN_PROJ: (
+            "model.action_in_proj", # smolvla
+        ),
+
+        MODEL_TENSOR.VLA_ACT_OUT_PROJ: (
+            "model.action_out_proj", # smolvla
+        ),
+
+        MODEL_TENSOR.VLA_ACT_TIME_MLP_IN: (
+            "model.action_time_mlp_in", # smolvla
+        ),
+
+        MODEL_TENSOR.VLA_ACT_TIME_MLP_OUT: (
+            "model.action_time_mlp_out", # smolvla
+        ),
+
+        MODEL_TENSOR.VLA_EXP_OUTPUT_NORM: (
+            "lm_expert.norm", # smolvla
+        ),
     }
 
     block_mappings_cfg: dict[MODEL_TENSOR, tuple[str, ...]] = {
@@ -2785,6 +2809,35 @@ class TensorNameMap:
 
     # architecture-specific block mappings
     arch_block_mappings_cfg: dict[MODEL_ARCH, dict[MODEL_TENSOR, tuple[str, ...]]] = {
+        MODEL_ARCH.VLA: {
+            MODEL_TENSOR.VLA_EXP_ATTN_NORM: (
+                "lm_expert.layers.{bid}.input_layernorm",
+            ),
+            MODEL_TENSOR.VLA_EXP_ATTN_Q: (
+                "lm_expert.layers.{bid}.self_attn.q_proj",
+            ),
+            MODEL_TENSOR.VLA_EXP_ATTN_K: (
+                "lm_expert.layers.{bid}.self_attn.k_proj",
+            ),
+            MODEL_TENSOR.VLA_EXP_ATTN_V: (
+                "lm_expert.layers.{bid}.self_attn.v_proj",
+            ),
+            MODEL_TENSOR.VLA_EXP_ATTN_OUT: (
+                "lm_expert.layers.{bid}.self_attn.o_proj",
+            ),
+            MODEL_TENSOR.VLA_EXP_FFN_NORM: (
+                "lm_expert.layers.{bid}.post_attention_layernorm",
+            ),
+            MODEL_TENSOR.VLA_EXP_FFN_GATE: (
+                "lm_expert.layers.{bid}.mlp.gate_proj",
+            ),
+            MODEL_TENSOR.VLA_EXP_FFN_UP: (
+                "lm_expert.layers.{bid}.mlp.up_proj",
+            ),
+            MODEL_TENSOR.VLA_EXP_FFN_DOWN: (
+                "lm_expert.layers.{bid}.mlp.down_proj",
+            ),
+        },
         MODEL_ARCH.ARCTIC: {
             MODEL_TENSOR.FFN_NORM: (
                 "model.layers.{bid}.residual_layernorm",

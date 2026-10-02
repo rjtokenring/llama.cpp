@@ -402,6 +402,22 @@ struct llama_model_bloom : public llama_model_base {
 };
 
 
+// Stub for vision-language-action policies (tools/vla): libllama only loads their vocab
+// (vocab_only) and quantizes them; none of these are ever called
+struct llama_model_vla : public llama_model_base {
+    llama_model_vla(const struct llama_model_params & params) : llama_model_base(params) {}
+
+    [[noreturn]]
+    void load_arch_hparams(llama_model_loader & ml) override;
+
+    [[noreturn]]
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    [[noreturn]]
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 // Quant-only stub for mmproj GGUFs
 // none of these are ever called, they only exist to satisfy the llama_model_base interface
 struct llama_model_clip : public llama_model_base {

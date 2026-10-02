@@ -487,6 +487,48 @@ class Keys:
         BETA                = "xielu.beta"
         EPS                 = "xielu.eps"
 
+    class VLA:
+        # vision-language-action policies (tools/vla): one GGUF holds the vision tower,
+        # the VLM, the action expert and the state/action normalization statistics
+        POLICY_TYPE         = "vla.policy_type"
+        CHUNK_SIZE          = "vla.chunk_size"
+        NUM_STEPS           = "vla.num_steps"
+        STATE_DIM           = "vla.state_dim"
+        ACTION_DIM          = "vla.action_dim"
+        MAX_STATE_DIM       = "vla.max_state_dim"
+        MAX_ACTION_DIM      = "vla.max_action_dim"
+        MAX_LANG_TOKENS     = "vla.max_lang_tokens"
+        N_CAMERAS           = "vla.n_cameras"
+        TIME_MIN_PERIOD     = "vla.time_min_period"
+        TIME_MAX_PERIOD     = "vla.time_max_period"
+        NORM_EPS            = "vla.norm_eps"
+
+        class Vision:
+            IMAGE_SIZE          = "vla.vision.image_size"
+            PATCH_SIZE          = "vla.vision.patch_size"
+            EMBEDDING_LENGTH    = "vla.vision.embedding_length"
+            FEED_FORWARD_LENGTH = "vla.vision.feed_forward_length"
+            BLOCK_COUNT         = "vla.vision.block_count"
+            HEAD_COUNT          = "vla.vision.head_count"
+            LAYERNORM_EPS       = "vla.vision.layer_norm_epsilon"
+            SCALE_FACTOR        = "vla.vision.scale_factor"
+
+        class Text:
+            EMBEDDING_LENGTH    = "vla.text.embedding_length"
+            FEED_FORWARD_LENGTH = "vla.text.feed_forward_length"
+            BLOCK_COUNT         = "vla.text.block_count"
+            HEAD_COUNT          = "vla.text.head_count"
+            HEAD_COUNT_KV       = "vla.text.head_count_kv"
+            KEY_LENGTH          = "vla.text.key_length"
+            RMS_EPS             = "vla.text.layer_norm_rms_epsilon"
+            ROPE_FREQ_BASE      = "vla.text.rope.freq_base"
+
+        class Expert:
+            EMBEDDING_LENGTH    = "vla.expert.embedding_length"
+            FEED_FORWARD_LENGTH = "vla.expert.feed_forward_length"
+            BLOCK_COUNT         = "vla.expert.block_count"
+            SELF_ATTN_EVERY_N   = "vla.expert.self_attn_every_n_layers"
+
 
 #
 # recommended mapping of model tensor names for storage in gguf
@@ -654,6 +696,7 @@ class MODEL_ARCH(IntEnum):
     NANBEIGE         = auto()
     QWEN3TTS         = auto()
     POCKETTTS        = auto()
+    VLA              = auto()
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -1028,6 +1071,26 @@ class MODEL_TENSOR(IntEnum):
     V_ENC_EMBD_VSEP      = auto() # Deepseek-OCR
     V_RESMPL_QUERY_768   = auto() # Deepseek-OCR-2
     V_RESMPL_QUERY_1024  = auto() # Deepseek-OCR-2
+    # vision-language-action policies
+    VLA_STATE_PROJ           = auto()
+    VLA_ACT_IN_PROJ          = auto()
+    VLA_ACT_OUT_PROJ         = auto()
+    VLA_ACT_TIME_MLP_IN      = auto()
+    VLA_ACT_TIME_MLP_OUT     = auto()
+    VLA_NORM_STATE_MEAN      = auto()
+    VLA_NORM_STATE_STD       = auto()
+    VLA_NORM_ACTION_MEAN     = auto()
+    VLA_NORM_ACTION_STD      = auto()
+    VLA_EXP_ATTN_NORM        = auto()
+    VLA_EXP_ATTN_Q           = auto()
+    VLA_EXP_ATTN_K           = auto()
+    VLA_EXP_ATTN_V           = auto()
+    VLA_EXP_ATTN_OUT         = auto()
+    VLA_EXP_FFN_NORM         = auto()
+    VLA_EXP_FFN_GATE         = auto()
+    VLA_EXP_FFN_UP           = auto()
+    VLA_EXP_FFN_DOWN         = auto()
+    VLA_EXP_OUTPUT_NORM      = auto()
 
     # qformer projector (vision) - Granite4 Vision
     V_QF_PROJ_QUERY      = auto()
@@ -1419,6 +1482,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.NANBEIGE:         "nanbeige",
     MODEL_ARCH.QWEN3TTS:         "qwen3tts",
     MODEL_ARCH.POCKETTTS:        "pockettts",
+    MODEL_ARCH.VLA:              "vla",
 }
 
 VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
@@ -2020,6 +2084,25 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DFLASH_SELECTOR_NEXT:      "selector_successor",
     MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN:    "selector_hidden",
     MODEL_TENSOR.D2T:                       "d2t",
+    MODEL_TENSOR.VLA_STATE_PROJ:                 "state_proj",
+    MODEL_TENSOR.VLA_ACT_IN_PROJ:                "act.in_proj",
+    MODEL_TENSOR.VLA_ACT_OUT_PROJ:               "act.out_proj",
+    MODEL_TENSOR.VLA_ACT_TIME_MLP_IN:            "act.time_mlp_in",
+    MODEL_TENSOR.VLA_ACT_TIME_MLP_OUT:           "act.time_mlp_out",
+    MODEL_TENSOR.VLA_NORM_STATE_MEAN:            "norm.state_mean",
+    MODEL_TENSOR.VLA_NORM_STATE_STD:             "norm.state_std",
+    MODEL_TENSOR.VLA_NORM_ACTION_MEAN:           "norm.action_mean",
+    MODEL_TENSOR.VLA_NORM_ACTION_STD:            "norm.action_std",
+    MODEL_TENSOR.VLA_EXP_ATTN_NORM:              "exp.blk.{bid}.attn_norm",
+    MODEL_TENSOR.VLA_EXP_ATTN_Q:                 "exp.blk.{bid}.attn_q",
+    MODEL_TENSOR.VLA_EXP_ATTN_K:                 "exp.blk.{bid}.attn_k",
+    MODEL_TENSOR.VLA_EXP_ATTN_V:                 "exp.blk.{bid}.attn_v",
+    MODEL_TENSOR.VLA_EXP_ATTN_OUT:               "exp.blk.{bid}.attn_output",
+    MODEL_TENSOR.VLA_EXP_FFN_NORM:               "exp.blk.{bid}.ffn_norm",
+    MODEL_TENSOR.VLA_EXP_FFN_GATE:               "exp.blk.{bid}.ffn_gate",
+    MODEL_TENSOR.VLA_EXP_FFN_UP:                 "exp.blk.{bid}.ffn_up",
+    MODEL_TENSOR.VLA_EXP_FFN_DOWN:               "exp.blk.{bid}.ffn_down",
+    MODEL_TENSOR.VLA_EXP_OUTPUT_NORM:            "exp.output_norm",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -5676,6 +5759,49 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_NORM,
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
+    ],
+    MODEL_ARCH.VLA: [
+        MODEL_TENSOR.V_ENC_EMBD_PATCH,
+        MODEL_TENSOR.V_ENC_EMBD_POS,
+        MODEL_TENSOR.V_ENC_INPUT_NORM,
+        MODEL_TENSOR.V_ENC_ATTN_Q,
+        MODEL_TENSOR.V_ENC_ATTN_K,
+        MODEL_TENSOR.V_ENC_ATTN_V,
+        MODEL_TENSOR.V_ENC_ATTN_O,
+        MODEL_TENSOR.V_ENC_POST_ATTN_NORM,
+        MODEL_TENSOR.V_ENC_FFN_UP,
+        MODEL_TENSOR.V_ENC_FFN_DOWN,
+        MODEL_TENSOR.V_POST_NORM,
+        MODEL_TENSOR.V_MMPROJ_FC,
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.VLA_STATE_PROJ,
+        MODEL_TENSOR.VLA_ACT_IN_PROJ,
+        MODEL_TENSOR.VLA_ACT_OUT_PROJ,
+        MODEL_TENSOR.VLA_ACT_TIME_MLP_IN,
+        MODEL_TENSOR.VLA_ACT_TIME_MLP_OUT,
+        MODEL_TENSOR.VLA_NORM_STATE_MEAN,
+        MODEL_TENSOR.VLA_NORM_STATE_STD,
+        MODEL_TENSOR.VLA_NORM_ACTION_MEAN,
+        MODEL_TENSOR.VLA_NORM_ACTION_STD,
+        MODEL_TENSOR.VLA_EXP_ATTN_NORM,
+        MODEL_TENSOR.VLA_EXP_ATTN_Q,
+        MODEL_TENSOR.VLA_EXP_ATTN_K,
+        MODEL_TENSOR.VLA_EXP_ATTN_V,
+        MODEL_TENSOR.VLA_EXP_ATTN_OUT,
+        MODEL_TENSOR.VLA_EXP_FFN_NORM,
+        MODEL_TENSOR.VLA_EXP_FFN_GATE,
+        MODEL_TENSOR.VLA_EXP_FFN_UP,
+        MODEL_TENSOR.VLA_EXP_FFN_DOWN,
+        MODEL_TENSOR.VLA_EXP_OUTPUT_NORM,
     ],
 }
 

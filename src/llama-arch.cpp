@@ -159,6 +159,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_NANBEIGE,         "nanbeige"         },
     { LLM_ARCH_QWEN3TTS,         "qwen3tts"         },
     { LLM_ARCH_POCKETTTS,        "pockettts"        },
+    { LLM_ARCH_VLA,              "vla"              }, // dummy, tokenizer and llama-quantize only; runtime in tools/vla
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 

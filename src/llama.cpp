@@ -352,6 +352,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
         }
+        if (model->arch == LLM_ARCH_VLA && !params.vocab_only) {
+            throw std::runtime_error("VLA policies run with tools/vla (llama-vla-cli, llama-vla-server); only their vocab can be loaded here");
+        }
         try {
             model->load_vocab(ml);
         } catch(const std::exception & e) {
