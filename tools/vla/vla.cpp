@@ -64,6 +64,33 @@ struct vla_loader {
         return v;
     }
 
+    // returns an empty vector for a missing optional key
+    std::vector<std::string> get_str_arr(const char * name, bool required, size_t max_n) const {
+        const int64_t i = gguf_find_key(gguf, name);
+        if (i < 0) {
+            if (required) {
+                throw std::runtime_error(format("missing key %s", name));
+            }
+            return {};
+        }
+        if (gguf_get_kv_type(gguf, i) != GGUF_TYPE_ARRAY || gguf_get_arr_type(gguf, i) != GGUF_TYPE_STRING) {
+            throw std::runtime_error(format("key %s is not a string array", name));
+        }
+        const size_t n = gguf_get_arr_n(gguf, i);
+        if (n == 0 || n > max_n) {
+            throw std::runtime_error(format("key %s has %zu values", name, n));
+        }
+        std::vector<std::string> v;
+        for (size_t j = 0; j < n; j++) {
+            const char * s = gguf_get_arr_str(gguf, i, j);
+            if (strlen(s) > 256) {
+                throw std::runtime_error(format("key %s: name too long", name));
+            }
+            v.push_back(s);
+        }
+        return v;
+    }
+
     std::string get_str(const char * name) const {
         const int64_t i = key(name);
         if (gguf_get_kv_type(gguf, i) != GGUF_TYPE_STRING) {
@@ -129,7 +156,8 @@ static void vla_load_hparams(vla_loader & ml, vla_hparams & hp) {
     hp.max_state_dim   = ml.get_i32("vla.max_state_dim", 4096);
     hp.max_action_dim  = ml.get_i32("vla.max_action_dim", 4096);
     hp.max_lang_tokens = ml.get_i32("vla.max_lang_tokens", 4096);
-    hp.n_cameras       = ml.get_i32("vla.n_cameras", 16);
+    hp.camera_names    = ml.get_str_arr("vla.camera_names", true, 16);
+    hp.n_cameras       = (int32_t) hp.camera_names.size();
     hp.time_min_period = ml.get_f32("vla.time_min_period");
     hp.time_max_period = ml.get_f32("vla.time_max_period");
     hp.norm_eps        = ml.get_f32("vla.norm_eps");
@@ -156,6 +184,13 @@ static void vla_load_hparams(vla_loader & ml, vla_hparams & hp) {
     hp.e_n_ff              = ml.get_i32("vla.expert.feed_forward_length");
     hp.e_n_layer           = ml.get_i32("vla.expert.block_count", 256);
     hp.e_self_attn_every_n = ml.get_i32("vla.expert.self_attn_every_n_layers", 256);
+
+    hp.state_names  = ml.get_str_arr("vla.state_names", false, 4096);
+    hp.action_names = ml.get_str_arr("vla.action_names", false, 4096);
+    if ((!hp.state_names.empty() && (int32_t) hp.state_names.size() != hp.state_dim)
+            || (!hp.action_names.empty() && (int32_t) hp.action_names.size() != hp.action_dim)) {
+        throw std::runtime_error("state or action names do not match their size");
+    }
 
     const int32_t grid = hp.v_image_size / hp.v_patch_size;
     if (hp.v_image_size % hp.v_patch_size != 0 || grid % hp.v_scale_factor != 0 || hp.v_n_embd % hp.v_n_head != 0) {
@@ -427,6 +462,22 @@ vla_info vla_get_info(const vla_context * ctx) {
     return info;
 }
 
+static const char * vla_name(const std::vector<std::string> & names, int32_t i) {
+    return i >= 0 && i < (int32_t) names.size() ? names[i].c_str() : nullptr;
+}
+
+const char * vla_camera_name(const vla_context * ctx, int32_t i) {
+    return vla_name(ctx->model.hparams.camera_names, i);
+}
+
+const char * vla_state_name(const vla_context * ctx, int32_t i) {
+    return vla_name(ctx->model.hparams.state_names, i);
+}
+
+const char * vla_action_name(const vla_context * ctx, int32_t i) {
+    return vla_name(ctx->model.hparams.action_names, i);
+}
+
 int32_t vla_tokenize(const vla_context * ctx, const char * prompt, int32_t * tokens, int32_t n_tokens_max) {
     // LeRobot appends a newline to the SmolVLA task, then truncates to max_lang_tokens
     const std::string text = std::string(prompt) + "\n";
@@ -445,6 +496,52 @@ int32_t vla_tokenize(const vla_context * ctx, const char * prompt, int32_t * tok
 }
 
 // the patch embedding conv has stride == kernel, so cut the patches here and let the graph do a plain matmul
+static float vla_pixel(const vla_image & img, int64_t x, int64_t y, int ch) {
+    const int64_t i = (y * img.nx + x) * 3 + ch;
+    return img.format == VLA_IMAGE_RGB_U8 ? ((const uint8_t *) img.data)[i] / 255.0f : ((const float *) img.data)[i];
+}
+
+// LeRobot resize_with_pad for SmolVLA: keep the aspect ratio, bilinear with align_corners=False and no
+// antialias, pad on the left and top with 0; returns S x S interleaved RGB in [0, 1]
+static std::vector<float> vla_resize_with_pad(const vla_image & img, int64_t S) {
+    std::vector<float> out(S * S * 3, 0.0f);
+    if (img.nx == S && img.ny == S) {
+        for (int64_t y = 0; y < S; y++) {
+            for (int64_t x = 0; x < S; x++) {
+                for (int ch = 0; ch < 3; ch++) {
+                    out[(y * S + x) * 3 + ch] = vla_pixel(img, x, y, ch);
+                }
+            }
+        }
+        return out;
+    }
+    const double  ratio = std::max((double) img.nx / S, (double) img.ny / S);
+    const int64_t rw    = (int64_t) (img.nx / ratio);
+    const int64_t rh    = (int64_t) (img.ny / ratio);
+    auto src = [](int64_t i, int64_t n_in, int64_t n_out, int64_t & i0, int64_t & i1, float & f) {
+        const float s = std::max(((float) i + 0.5f) * n_in / n_out - 0.5f, 0.0f);
+        i0 = std::min((int64_t) s, n_in - 1);
+        i1 = std::min(i0 + 1, n_in - 1);
+        f  = s - i0;
+    };
+    for (int64_t y = 0; y < rh; y++) {
+        int64_t y0, y1;
+        float fy;
+        src(y, img.ny, rh, y0, y1, fy);
+        for (int64_t x = 0; x < rw; x++) {
+            int64_t x0, x1;
+            float fx;
+            src(x, img.nx, rw, x0, x1, fx);
+            for (int ch = 0; ch < 3; ch++) {
+                const float top = vla_pixel(img, x0, y0, ch) * (1 - fx) + vla_pixel(img, x1, y0, ch) * fx;
+                const float bot = vla_pixel(img, x0, y1, ch) * (1 - fx) + vla_pixel(img, x1, y1, ch) * fx;
+                out[((S - rh + y) * S + S - rw + x) * 3 + ch] = top * (1 - fy) + bot * fy;
+            }
+        }
+    }
+    return out;
+}
+
 static void vla_set_patches(const vla_context & ctx, const vla_input & in) {
     const vla_hparams & hp = ctx.model.hparams;
     const int64_t S = hp.v_image_size;
@@ -452,16 +549,13 @@ static void vla_set_patches(const vla_context & ctx, const vla_input & in) {
     const int64_t G = S / P;
     std::vector<float> patches(S * S * 3 * hp.n_cameras);
     for (int c = 0; c < hp.n_cameras; c++) {
-        const vla_image & img = in.images[c];
+        const std::vector<float> img = vla_resize_with_pad(in.images[c], S);
         for (int64_t y = 0; y < S; y++) {
             for (int64_t x = 0; x < S; x++) {
                 const int64_t patch = (y / P) * G + x / P;
                 for (int ch = 0; ch < 3; ch++) {
-                    const int64_t i = (y * S + x) * 3 + ch;
-                    const float v = img.format == VLA_IMAGE_RGB_U8 ? ((const uint8_t *) img.data)[i] / 255.0f
-                                                                   : ((const float *) img.data)[i];
                     // same element order as the conv kernel [P, P, 3, n_embd]; SigLIP takes pixels in [-1, 1]
-                    patches[((c * G * G + patch) * 3 + ch) * P * P + (y % P) * P + x % P] = v * 2.0f - 1.0f;
+                    patches[((c * G * G + patch) * 3 + ch) * P * P + (y % P) * P + x % P] = img[(y * S + x) * 3 + ch] * 2.0f - 1.0f;
                 }
             }
         }
@@ -586,8 +680,10 @@ int32_t vla_predict(vla_context * ctx, const vla_input * in, float * actions) {
         }
     }
     for (int i = 0; i < in->n_images; i++) {
-        if (in->images[i].nx != hp.v_image_size || in->images[i].ny != hp.v_image_size) {
-            VLA_LOG_ERR("%s: images must be %dx%d\n", __func__, hp.v_image_size, hp.v_image_size);
+        const vla_image & img = in->images[i];
+        if (!img.data || img.nx < 1 || img.ny < 1 || img.nx > 8192 || img.ny > 8192
+                || (img.format != VLA_IMAGE_RGB_U8 && img.format != VLA_IMAGE_RGB_F32)) {
+            VLA_LOG_ERR("%s: image %d: bad size or format\n", __func__, i);
             return 1;
         }
     }

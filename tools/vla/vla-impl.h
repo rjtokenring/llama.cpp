@@ -14,6 +14,9 @@ struct llama_model;
 
 struct vla_hparams {
     std::string policy_type;
+    std::vector<std::string> camera_names; // images are passed in this order
+    std::vector<std::string> state_names;  // optional, empty or state_dim names
+    std::vector<std::string> action_names; // optional, empty or action_dim names
 
     int32_t chunk_size      = 0;
     int32_t num_steps       = 0;

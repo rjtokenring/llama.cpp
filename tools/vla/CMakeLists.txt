@@ -25,8 +25,13 @@ install(TARGETS vla LIBRARY PUBLIC_HEADER)
 
 set(TARGET llama-vla-cli)
 add_executable(${TARGET} vla-cli.cpp)
-target_link_libraries(${TARGET} PRIVATE vla)
+target_link_libraries(${TARGET} PRIVATE vla llama vendor::stb)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+if (NOT MSVC)
+    # for stb_image.h
+    target_compile_options(${TARGET} PRIVATE -Wno-cast-qual)
+endif()
 
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} RUNTIME)

@@ -107,7 +107,13 @@ class SmolVLAModel(TextModel):
         w.add_uint32(K.MAX_STATE_DIM, hp["max_state_dim"])
         w.add_uint32(K.MAX_ACTION_DIM, hp["max_action_dim"])
         w.add_uint32(K.MAX_LANG_TOKENS, hp["tokenizer_max_length"])
-        w.add_uint32(K.N_CAMERAS, sum(1 for f in hp["input_features"].values() if f["type"] == "VISUAL"))
+        # images are passed in this order; the names are the LeRobot observation.images.* keys
+        w.add_array(K.CAMERA_NAMES, [k.removeprefix("observation.images.") for k, f in hp["input_features"].items() if f["type"] == "VISUAL"])
+        for key, feature, n in ((K.STATE_NAMES, "observation.state", hp["input_features"]["observation.state"]["shape"][0]),
+                                (K.ACTION_NAMES, "action", hp["output_features"]["action"]["shape"][0])):
+            names = self._dataset_names(feature)
+            if names is not None and len(names) == n:
+                w.add_array(key, names)
         w.add_float32(K.TIME_MIN_PERIOD, hp["min_period"])
         w.add_float32(K.TIME_MAX_PERIOD, hp["max_period"])
         w.add_float32(K.NORM_EPS, self._processor_step("policy_postprocessor.json", "unnormalizer_processor")["config"]["eps"])
@@ -135,6 +141,24 @@ class SmolVLAModel(TextModel):
         w.add_uint32(K.Expert.FEED_FORWARD_LENGTH, n_ff_exp)
         w.add_uint32(K.Expert.BLOCK_COUNT, n_layer_exp)
         w.add_uint32(K.Expert.SELF_ATTN_EVERY_N, hp["self_attn_every_n_layers"])
+
+    def _dataset_names(self, feature: str) -> list[str] | None:
+        # only checkpoints with a train_config.json name their dataset, whose meta/info.json may name each value
+        path = self.dir_model / "train_config.json"
+        if not path.is_file():
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            repo_id = json.load(f).get("dataset", {}).get("repo_id")
+        if not repo_id:
+            return None
+        try:
+            from huggingface_hub import hf_hub_download
+            with open(hf_hub_download(repo_id, "meta/info.json", repo_type="dataset"), "r", encoding="utf-8") as f:
+                names = json.load(f)["features"][feature].get("names")
+        except Exception as e:
+            logger.warning(f"no {feature} names from dataset {repo_id}: {e}")
+            return None
+        return names if isinstance(names, list) and all(isinstance(n, str) for n in names) else None
 
     def _processor_step(self, file: str, step: str) -> dict[str, Any]:
         with open(self.dir_model / file, "r", encoding="utf-8") as f:

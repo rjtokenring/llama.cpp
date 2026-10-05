@@ -44,7 +44,7 @@ struct vla_context_params {
 struct vla_info {
     const char * policy_type;
     int32_t n_cameras;
-    int32_t image_size;      // images are resized to image_size x image_size
+    int32_t image_size;      // images of any size are resized and padded to image_size x image_size
     int32_t state_dim;
     int32_t action_dim;
     int32_t max_action_dim;  // padded action size, the size of one row of noise
@@ -66,7 +66,7 @@ struct vla_image {
 };
 
 struct vla_input {
-    const struct vla_image * images;   // n_cameras images, in the order the policy was trained with
+    const struct vla_image * images;   // n_cameras images, in vla_camera_name() order
     int32_t                  n_images;
     const float *            state;    // state_dim values, not normalized
     int32_t                  n_state;
@@ -82,6 +82,12 @@ VLA_API struct vla_context * vla_init_from_file(const char * path, struct vla_co
 VLA_API void                 vla_free(struct vla_context * ctx);
 
 VLA_API struct vla_info vla_get_info(const struct vla_context * ctx);
+
+// name of camera i, as in the training dataset (vla_input.images follows this order)
+VLA_API const char * vla_camera_name(const struct vla_context * ctx, int32_t i);
+// name of state/action value i, or NULL when the GGUF does not name them
+VLA_API const char * vla_state_name (const struct vla_context * ctx, int32_t i);
+VLA_API const char * vla_action_name(const struct vla_context * ctx, int32_t i);
 
 // tokenize a task prompt the way the policy was trained; returns the number of tokens, or -n if n_tokens_max is too small
 VLA_API int32_t vla_tokenize(const struct vla_context * ctx, const char * prompt, int32_t * tokens, int32_t n_tokens_max);
