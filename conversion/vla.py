@@ -8,6 +8,8 @@ from typing import Any, Callable, Iterable, TYPE_CHECKING
 if TYPE_CHECKING:
     from torch import Tensor
 
+import torch
+
 from .base import ModelBase, TextModel, gguf, logger
 
 # LeRobot vision-language-action policies, run by tools/vla.
@@ -173,6 +175,12 @@ class SmolVLAModel(TextModel):
         yield self.format_tensor_name(gguf.MODEL_TENSOR.VLA_NORM_STATE_STD, suffix=""), pre["observation.state.std"].float()
         yield self.format_tensor_name(gguf.MODEL_TENSOR.VLA_NORM_ACTION_MEAN, suffix=""), post["action.mean"].float()
         yield self.format_tensor_name(gguf.MODEL_TENSOR.VLA_NORM_ACTION_STD, suffix=""), post["action.std"].float()
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        # LeRobot keeps some small heads and projections in F32, keep them so
+        if name in self.model_tensors and self.model_tensors[name]().dtype == torch.float32:
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if name.startswith("norm."):  # from generate_extra_tensors

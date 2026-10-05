@@ -36,3 +36,17 @@ endif()
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} RUNTIME)
 endif()
+
+set(TARGET llama-vla-server)
+add_executable(${TARGET} vla-server.cpp)
+target_link_libraries(${TARGET} PRIVATE vla llama llama-common cpp-httplib vendor::stb ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+if (NOT MSVC)
+    # for stb_image.h
+    target_compile_options(${TARGET} PRIVATE -Wno-cast-qual)
+endif()
+
+if(LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET} RUNTIME)
+endif()
