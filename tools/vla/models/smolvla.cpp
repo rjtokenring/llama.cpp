@@ -64,45 +64,44 @@ static ggml_tensor * build_gelu_tanh(ggml_context * ctx0, ggml_tensor * x) {
     return ggml_mul(ctx0, x, ggml_sigmoid(ctx0, ggml_scale(ctx0, t, 2.0f * sqrtf(2.0f / (float) M_PI))));
 }
 
-// SigLIP tower, pixel shuffle and connector of SmolVLM: [P*P*3, N, B] -> [n_embd_text, n_img_tokens, B]
-static ggml_tensor * build_vision(vla_context & ctx, ggml_context * ctx0, ggml_tensor * patches) {
+// SigLIP tower, pixel shuffle and connector of SmolVLM for one camera: [P*P*3, N] -> [n_embd_text, n_img_tokens]
+// one camera at a time keeps every activation 2D, which is also what ggml-hexagon flash attention takes
+static ggml_tensor * build_vision(vla_context & ctx, ggml_context * ctx0, ggml_tensor * patches, int cam) {
     const vla_model & m = ctx.model;
     const vla_hparams & hp = m.hparams;
     const int64_t C    = hp.v_n_embd;
     const int64_t d    = C / hp.v_n_head;
     const int64_t grid = hp.v_image_size / hp.v_patch_size;
     const int64_t N    = grid * grid;
-    const int64_t B    = patches->ne[2];
     const int64_t s    = hp.v_scale_factor;
 
     ggml_tensor * x = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, m.patch_w, patches->ne[0], C), patches);
     x = ggml_add(ctx0, x, m.patch_b);
     x = ggml_add(ctx0, x, m.pos_embd);
-    ggml_set_name(x, "v_inp");
+    ggml_format_name(x, "v_inp-c%d", cam);
 
     for (size_t il = 0; il < m.vit.size(); il++) {
         const auto & l = m.vit[il];
         ggml_tensor * h = build_norm(ctx0, x, l.ln1_w, l.ln1_b, hp.v_eps);
-        ggml_tensor * q = ggml_reshape_4d(ctx0, build_linear(ctx0, h, l.q_w, l.q_b), d, hp.v_n_head, N, B);
-        ggml_tensor * k = ggml_reshape_4d(ctx0, build_linear(ctx0, h, l.k_w, l.k_b), d, hp.v_n_head, N, B);
-        ggml_tensor * v = ggml_reshape_4d(ctx0, build_linear(ctx0, h, l.v_w, l.v_b), d, hp.v_n_head, N, B);
+        ggml_tensor * q = ggml_reshape_3d(ctx0, build_linear(ctx0, h, l.q_w, l.q_b), d, hp.v_n_head, N);
+        ggml_tensor * k = ggml_reshape_3d(ctx0, build_linear(ctx0, h, l.k_w, l.k_b), d, hp.v_n_head, N);
+        ggml_tensor * v = ggml_reshape_3d(ctx0, build_linear(ctx0, h, l.v_w, l.v_b), d, hp.v_n_head, N);
         h = build_attn(ctx0, q, k, v, nullptr, 1.0f / sqrtf((float) d), ctx.params.flash_attn);
-        x = ggml_add(ctx0, x, build_linear(ctx0, h, l.o_w, l.o_b));
+        x = ggml_add(ctx0, x, build_linear(ctx0, ggml_reshape_2d(ctx0, h, C, N), l.o_w, l.o_b));
 
         h = build_norm(ctx0, x, l.ln2_w, l.ln2_b, hp.v_eps);
         h = build_gelu_tanh(ctx0, build_linear(ctx0, h, l.up_w, l.up_b));
         x = ggml_add(ctx0, x, build_linear(ctx0, h, l.down_w, l.down_b));
-        ggml_format_name(x, "v_out-%zu", il);
+        ggml_format_name(x, "v_out-%zu-c%d", il, cam);
     }
     x = build_norm(ctx0, x, m.post_ln_w, m.post_ln_b, hp.v_eps);
-    ggml_set_name(x, "v_post_ln");
 
-    // pixel shuffle, as clip_graph::build_patch_merge_permute with a batch dim
-    x = ggml_reshape_4d(ctx0, x, C * s, grid / s, grid, B);
+    // pixel shuffle, as clip_graph::build_patch_merge_permute
+    x = ggml_reshape_3d(ctx0, x, C * s, grid / s, grid);
     x = ggml_permute(ctx0, x, 0, 2, 1, 3);
-    x = ggml_cont_4d(ctx0, x, C * s * s, grid / s, grid / s, B);
+    x = ggml_cont_3d(ctx0, x, C * s * s, grid / s, grid / s);
     x = ggml_permute(ctx0, x, 0, 2, 1, 3);
-    x = ggml_cont_3d(ctx0, x, C * s * s, N / (s * s), B);
+    x = ggml_cont_2d(ctx0, x, C * s * s, N / (s * s));
 
     return ggml_mul_mat(ctx0, m.mm_fc, x);
 }
@@ -226,12 +225,18 @@ ggml_cgraph * vla_build_smolvla(vla_context & ctx, ggml_context * ctx0) {
         ggml_set_input(t);
     }
 
-    ggml_tensor * img = build_vision(ctx, ctx0, ctx.inp.patches);
+    ggml_tensor * img = nullptr;
+    for (int c = 0; c < hp.n_cameras; c++) {
+        ggml_tensor * patches = ggml_view_2d(ctx0, ctx.inp.patches, P * P * 3, hp.n_patches(), ctx.inp.patches->nb[1],
+                                             c * ctx.inp.patches->nb[2]);
+        ggml_tensor * cur = build_vision(ctx, ctx0, patches, c);
+        img = img ? ggml_concat(ctx0, img, cur, 1) : cur;
+    }
     ggml_set_name(img, "img_tokens");
 
     // SmolVLA scales image and language embeddings by sqrt(n_embd), not the state
     const float scale = sqrtf((float) hp.t_n_embd);
-    img = ggml_scale(ctx0, ggml_reshape_2d(ctx0, img, hp.t_n_embd, img->ne[1] * img->ne[2]), scale);
+    img = ggml_scale(ctx0, img, scale);
     ggml_tensor * lang  = ggml_scale(ctx0, ggml_get_rows(ctx0, m.tok_embd, ctx.inp.tokens), scale);
     ggml_tensor * state = build_linear(ctx0, ggml_reshape_2d(ctx0, ctx.inp.state, hp.max_state_dim, 1), m.state_proj_w, m.state_proj_b);
     ggml_tensor * prefix = ggml_concat(ctx0, ggml_concat(ctx0, img, lang, 1), state, 1);

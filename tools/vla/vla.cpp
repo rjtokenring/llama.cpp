@@ -688,15 +688,19 @@ int32_t vla_predict(vla_context * ctx, const vla_input * in, float * actions) {
         }
     }
 
-    ggml_init_params params = { ctx->compute_meta.size(), ctx->compute_meta.data(), true };
-    vla_ggml_ctx_ptr ctx0(ggml_init(params));
-    ggml_cgraph * gf = vla_build_smolvla(*ctx, ctx0.get());
-
-    ggml_backend_sched_reset(ctx->sched.get());
-    if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
-        VLA_LOG_ERR("%s: failed to allocate the graph\n", __func__);
-        return 2;
+    // every shape is fixed by the GGUF, so the graph is built and allocated once; later calls only set inputs
+    if (!ctx->gf) {
+        ggml_init_params params = { ctx->compute_meta.size(), ctx->compute_meta.data(), true };
+        ctx->ctx_graph.reset(ggml_init(params));
+        ctx->gf = vla_build_smolvla(*ctx, ctx->ctx_graph.get());
+        ggml_backend_sched_reset(ctx->sched.get());
+        if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), ctx->gf)) {
+            VLA_LOG_ERR("%s: failed to allocate the graph\n", __func__);
+            ctx->gf = nullptr;
+            return 2;
+        }
     }
+    ggml_cgraph * gf = ctx->gf;
     vla_set_patches(*ctx, *in);
     vla_set_prefix(*ctx, *in);
     vla_set_suffix(*ctx, *in);

@@ -172,6 +172,8 @@ struct vla_context {
 
     size_t               n_graph = 0;
     std::vector<uint8_t> compute_meta;
+    vla_ggml_ctx_ptr     ctx_graph;
+    ggml_cgraph *        gf = nullptr;
     vla_graph_inputs     inp;
 };
 
