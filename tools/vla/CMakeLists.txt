@@ -6,6 +6,8 @@ add_library(vla
             vla.cpp
             vla.h
             vla-impl.h
+            vla-graph.cpp
+            vla-graph.h
             models/smolvla.cpp
             )
 

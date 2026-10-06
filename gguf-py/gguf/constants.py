@@ -507,6 +507,7 @@ class Keys:
 
         class Vision:
             IMAGE_SIZE          = "vla.vision.image_size"
+            PAD_MODE            = "vla.vision.pad_mode"
             PATCH_SIZE          = "vla.vision.patch_size"
             EMBEDDING_LENGTH    = "vla.vision.embedding_length"
             FEED_FORWARD_LENGTH = "vla.vision.feed_forward_length"

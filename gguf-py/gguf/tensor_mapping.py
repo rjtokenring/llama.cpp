@@ -1575,6 +1575,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.V_MMPROJ_FC: (
             "model.connector.modality_projection.proj", # SmolVLM
+            "model.multi_modal_projector.linear", # pi0
             "model.vision.linear_proj.linear_proj", # cogvlm
             "model.projector.layers", # Deepseek-OCR
             "visual.merger.proj", # glm4v

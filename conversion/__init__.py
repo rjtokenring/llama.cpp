@@ -240,6 +240,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "Qwen3NextForCausalLM": "qwen",
     "Qwen3OmniMoeForConditionalGeneration": "qwen3vl",
     "PocketTTSModel": "pockettts",
+    "PI0Policy": "vla",
     "SmolVLAPolicy": "vla",
     "Qwen3TTSForConditionalGeneration": "qwen3tts",
     "Qwen3VLForConditionalGeneration": "qwen3vl",
