@@ -254,10 +254,10 @@ By default the backend exposes 4 virtual sessions on NPU 0, so no `GGML_HEXAGON_
 ```
 
 Notes:
-- The free memory a session reports is `GGML_HEXAGON_VMEM_USABLE` (default 3328 MiB), not the whole window. On Linux the
-  IOMMU maps every buffer into a slot aligned to the next power of two of its size inside a 32-bit space: 16 slots of
-  256 MiB, of which one holds the MSI region, one the op queue memory and one is kept for cross-session copies. Buffers
-  are therefore chunked at `GGML_HEXAGON_MBUF` = 256 MiB, and a single tensor larger than that takes a 512 MiB or 1 GiB slot.
+- The free memory a session reports is its VA window minus the op queue memory (~3.1 GB). On Linux the IOMMU maps every
+  buffer into a slot aligned to the next power of two of its size inside a 32-bit space, so buffers are chunked at
+  `GGML_HEXAGON_MBUF` = 256 MiB with the 4 KiB guard page kept inside the chunk; a single tensor larger than that takes a
+  512 MiB or 1 GiB slot.
 - `-fit off` is recommended together with `--device HTP`. `--fit` would rather move layers to the CPU than add a session.
 - If the model does not fit on any number of sessions, or a session cannot be opened (e.g. the system-wide FastRPC
   session limit was reached by other processes), the load fails with an error instead of guessing.
@@ -346,10 +346,6 @@ on 4 physical NPUs, or `--devices 'HTP0[0-1:0],HTP1[0-1:1]'` on 2 physical NPUs 
     - `HTP0[0-1]`: A single logical device `HTP0` that groups physical cores 0 and 1.
     - `HTP0[0-1],HTP1[2-3]`: Two layer-split devices across 4 physical NPUs (cores 0-1 and 2-3).
     - `HTP0[0-1:0],HTP1[0-1:1]`: Two layer-split devices across 2 physical NPUs using virtual sessions 0 and 1.
-
-- `GGML_HEXAGON_VMEM_USABLE` (default: 3328, in MiB)
-  Memory a session reports as free to llama.cpp (`--device HTP`, `--fit`, `--list-devices`). The total stays the VA
-  window. `0` reports the whole window.
 
 - `GGML_HEXAGON_NDEV` (deprecated)
   Replaced by `GGML_HEXAGON_DEVICES`. Controls the number of virtual sessions to allocate on physical NPU `0`.

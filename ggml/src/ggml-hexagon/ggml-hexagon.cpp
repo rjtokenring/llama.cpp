@@ -93,7 +93,6 @@ static size_t opt_ndev    = 1;
 static size_t opt_nhvx    = 0; // use all
 static int    opt_nhmx    = 1; // when set, enable HMX; when 0, use HVX only
 static size_t opt_vmem    = HTP_OP_MAX_VMEM_DEFAULT;  // max available va space for buffer mappings
-static size_t opt_vmem_usable = 3328ul * 1024 * 1024; // 13 slots of 256 MiB: 16 in the 32-bit IOMMU space, minus MSI, op queue shm and cross-session clones; 0 = full window
 static bool   opt_vmem_measure = false; // GGML_HEXAGON_VMEM=0 : measure the mappable memory of every session at open
 
 template<typename T> std::vector<T> str_to_vec(const char* str);
@@ -2742,8 +2741,9 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(
     try {
         ggml_hexagon_shared_buffer * sbuf = new ggml_hexagon_shared_buffer(sess, size, false);
         // map large buffers now, in allocation order: the IOMMU gives each buffer a slot aligned to the next power of two
-        // of its size, a large buffer mapped late (first use) may not find a free slot after many small ones
-        if (size >= 128u * 1024 * 1024) {
+        // of its size, a large buffer mapped late (first use) may not find a free slot after many small ones.
+        // Not with DMA64: weights need the extended mapping, chosen at first use (see mmap_tensor)
+        if (!opt_dma64 && size >= 128u * 1024 * 1024) {
             sbuf->mmap();
         }
         return ggml_backend_buffer_init(buffer_type, ggml_backend_hexagon_buffer_interface, sbuf, size);
@@ -4730,22 +4730,27 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
         throw std::runtime_error("ggml-hex: iface start failed (see log for details)");
     }
 
-    // GGML_HEXAGON_VMEM=0 + GGML_HEXAGON_VMEM_SEQ="67,1023,256,100,131,1016" : replay a sequence of buffer sizes (MiB, +4 KiB guard)
-    // after the session is fully started, to compare with the mappings of a real load
+    // GGML_HEXAGON_VMEM=0 + GGML_HEXAGON_VMEM_SEQ="67,1023,256,100,131,1016" : replay a sequence of buffer sizes after the
+    // session is fully started, to compare with the mappings of a real load. "N" maps N MiB including the 4 KiB guard page,
+    // "N+" maps N MiB of data plus the guard page (what a chunk that fills a max buffer size of N gets).
     if (opt_vmem_measure) {
         if (const char * seq = getenv("GGML_HEXAGON_VMEM_SEQ")) {
             const size_t MiB = 1024 * 1024;
             std::vector<ggml_hexagon_shared_buffer *> bufs;
             size_t total = 0;
-            for (auto sz : str_to_vec<size_t>(seq)) {
-                const char * res = "ok";
+            std::string item;
+            std::stringstream ss(seq);
+            while (std::getline(ss, item, ',')) {
+                const bool   plus = !item.empty() && item.back() == '+';
+                const size_t sz   = strtoul(item.c_str(), NULL, 0);
+                const char * res  = "ok";
                 try {
-                    auto b = new ggml_hexagon_shared_buffer(this, sz * MiB - 4096, false);
+                    auto b = new ggml_hexagon_shared_buffer(this, plus ? sz * MiB : sz * MiB - 4096, false);
                     bufs.push_back(b);
                     b->mmap();
                     total += sz;
                 } catch (...) { res = "FAIL"; }
-                GGML_LOG_INFO("ggml-hex: %s replay: map %zu MiB -> %s (mapped so far %zu MiB)\n", this->c_name(), sz, res, total);
+                GGML_LOG_INFO("ggml-hex: %s replay: map %zu MiB%s -> %s (mapped so far %zu MiB)\n", this->c_name(), sz, plus ? "+4K" : "", res, total);
             }
             for (auto b : bufs) { delete b; }
         }
@@ -7986,9 +7991,8 @@ static void ggml_backend_hexagon_device_get_memory(ggml_backend_dev_t dev, size_
         vmem = opt_vmem > shm ? opt_vmem - shm : opt_vmem;
     }
 
-    // free is the practical limit: on QCS8300 sessions filled past ~2.1 GB fail their buffer mappings
     *total = vmem;
-    *free  = opt_vmem_usable && opt_vmem_usable < vmem ? opt_vmem_usable : vmem;
+    *free  = vmem;
 }
 
 static enum ggml_backend_dev_type ggml_backend_hexagon_device_get_type(ggml_backend_dev_t dev) {
@@ -8750,7 +8754,6 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
-    const char * str_vmem_usable = getenv("GGML_HEXAGON_VMEM_USABLE");
     const char * str_mbuf     = getenv("GGML_HEXAGON_MBUF");
     const char * str_optrace  = getenv("GGML_HEXAGON_OPTRACE");
     const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
@@ -8808,7 +8811,6 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
         opt_vmem_measure = true;
         opt_vmem         = HTP_OP_MAX_VMEM_DEFAULT;
     }
-    opt_vmem_usable = str_vmem_usable ? strtoul(str_vmem_usable, NULL, 0) * MiB : opt_vmem_usable;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf) != 0                 : opt_hostbuf;
 
     // Parse device configuration
