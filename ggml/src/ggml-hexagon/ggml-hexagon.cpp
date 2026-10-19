@@ -75,6 +75,7 @@
 #include "htp/concat-ops.h"
 #include "htp/cpy-ops.h"
 #include "htp/im2col-ops.h"
+#include "htp/upscale-ops.h"
 #include "htp_iface.h"
 #include "htp-drv.h"
 #include "htp-repack.h"
@@ -416,6 +417,12 @@ static bool ggml_hexagon_precompute_concat_params(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op,
     struct htp_concat_kernel_params * kparams
+);
+
+static bool ggml_hexagon_precompute_upscale_params(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op,
+    struct htp_upscale_kernel_params * kparams
 );
 
 static bool ggml_hexagon_precompute_cpy_params(
@@ -6741,6 +6748,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_IM2COL:          return HTP_OP_IM2COL;
         case GGML_OP_IM2COL_3D:       return HTP_OP_IM2COL_3D;
         case GGML_OP_ROLL:            return HTP_OP_ROLL;
+        case GGML_OP_UPSCALE:         return HTP_OP_UPSCALE;
 
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(t)) {
@@ -7039,6 +7047,11 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                 ggml_hexagon_precompute_concat_params(sess,
                     node.node,
                     (struct htp_concat_kernel_params *) node.kernel_params
+                );
+            } else if (node.opcode == HTP_OP_UPSCALE) {
+                ggml_hexagon_precompute_upscale_params(sess,
+                    node.node,
+                    (struct htp_upscale_kernel_params *) node.kernel_params
                 );
             } else if (node.opcode == HTP_OP_CPY || node.opcode == HTP_OP_CPY_FENCE) {
                 const bool ok = ggml_hexagon_precompute_cpy_params(sess,
@@ -7760,6 +7773,53 @@ static bool ggml_hexagon_supported_roll(const struct ggml_hexagon_session * sess
     return true;
 }
 
+static bool ggml_hexagon_precompute_upscale_params(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op,
+    struct htp_upscale_kernel_params * kparams
+) {
+    memset(kparams, 0, sizeof(*kparams));
+
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * dst  = op;
+
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int32_t mode = ggml_get_op_params_i32(op, 0);
+    if ((mode & 0xFF) != GGML_SCALE_MODE_BILINEAR || (mode & GGML_SCALE_FLAG_ANTIALIAS)) {
+        return false;
+    }
+
+    // kernel layout: src channels innermost (permuted position embeddings), dst contiguous
+    if (src0->nb[2] != sizeof(float) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    if (dst->ne[2] != src0->ne[2] || dst->ne[3] != src0->ne[3]) {
+        return false;
+    }
+
+    const size_t vtcm_per_thread = htp_upscale_vtcm_per_thread((uint32_t) src0->ne[0], (uint32_t) src0->ne[2]);
+
+    uint32_t n_threads = (std::min)((uint32_t) sess->n_threads, (uint32_t) (dst->ne[1] * dst->ne[3]));
+    while (n_threads > 0 && n_threads * vtcm_per_thread > sess->vtcm_size) {
+        n_threads--;
+    }
+    if (n_threads == 0) {
+        return false;
+    }
+
+    kparams->n_threads = n_threads;
+    kparams->vtcm_size = n_threads * vtcm_per_thread;
+    return true;
+}
+
+static bool ggml_hexagon_supported_upscale(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    struct htp_upscale_kernel_params kparams;
+    return ggml_hexagon_precompute_upscale_params(sess, op, &kparams);
+}
+
 // IMPORTANT: supports_op runs before buffer allocation and before tensor data is populated.
 // Never check buffer usage, buffer properties, or repacking state (is_tiled) here.
 // Support must depend only on static tensor properties (shape, type, strides).
@@ -7963,6 +8023,10 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_ROLL:
             supp = ggml_hexagon_supported_roll(sess, op);
+            break;
+
+        case GGML_OP_UPSCALE:
+            supp = ggml_hexagon_supported_upscale(sess, op);
             break;
 
         default:

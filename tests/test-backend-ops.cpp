@@ -7988,20 +7988,30 @@ struct test_interpolate : public test_case {
     const std::array<int64_t, 4> ne;
     const std::array<int64_t, 4> ne_tgt;
     const ggml_scale_mode mode = GGML_SCALE_MODE_NEAREST;
+    const bool permute; // src is a [ne2, ne0, ne1, ne3] tensor permuted to ne, as clip_graph::resize_position_embeddings()
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, ne_tgt, mode);
+        return VARS_TO_STR5(type, ne, ne_tgt, mode, permute);
     }
 
     test_interpolate(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne     = {2, 5,  7, 11},
             std::array<int64_t, 4> ne_tgt = {5, 7, 11, 13},
-            ggml_scale_mode mode = GGML_SCALE_MODE_NEAREST)
-        : type(type), ne(ne), ne_tgt(ne_tgt), mode(mode) {}
+            ggml_scale_mode mode = GGML_SCALE_MODE_NEAREST,
+            bool permute = false)
+        : type(type), ne(ne), ne_tgt(ne_tgt), mode(mode), permute(permute) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_set_name(a, "a");
+        ggml_tensor * a;
+        if (permute) {
+            a = ggml_new_tensor_4d(ctx, type, ne[2], ne[0], ne[1], ne[3]);
+            ggml_set_name(a, "a");
+            a = ggml_permute(ctx, a, 2, 0, 1, 3);
+            ggml_set_name(a, "a_permuted");
+        } else {
+            a = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_name(a, "a");
+        }
 
         ggml_tensor * out = ggml_interpolate(ctx, a, ne_tgt[0], ne_tgt[1],ne_tgt[2], ne_tgt[3], mode);
         ggml_set_name(out, "out");
@@ -11540,6 +11550,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {1, 4, 3, 2}, {2, 8, 3, 2}, (ggml_scale_mode)(mode | GGML_SCALE_FLAG_ALIGN_CORNERS)));
         test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {4, 1, 3, 2}, {1, 1, 3, 2}, (ggml_scale_mode)(mode | GGML_SCALE_FLAG_ALIGN_CORNERS)));
     }
+    // learned position embeddings resized to the image patch grid (clip_graph::resize_position_embeddings)
+    for (ggml_scale_mode mode : {GGML_SCALE_MODE_BILINEAR, (ggml_scale_mode)(GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ALIGN_CORNERS)}) {
+        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {7, 5, 33, 2}, {13, 9, 33, 2}, mode, true));
+        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {7, 5, 33, 2}, {5, 3, 33, 2}, mode, true));
+    }
+    test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {48, 48, 768, 1}, {64, 64, 768, 1}, (ggml_scale_mode)(GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ALIGN_CORNERS), true));
+    test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {48, 48, 768, 1}, {40, 30, 768, 1}, (ggml_scale_mode)(GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ALIGN_CORNERS), true));
 
     test_cases.emplace_back(new test_sum());
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, {11, 5, 6, 3}, {0, 2, 1, 3}));  // row-contiguous but non-contiguous

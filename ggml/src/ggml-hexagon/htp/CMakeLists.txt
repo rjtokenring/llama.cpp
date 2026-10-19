@@ -45,6 +45,7 @@ add_library(${HTP_LIB} SHARED
     argsort-ops.c
     im2col-ops.c
     roll-ops.c
+    upscale-ops.c
     pool-ops.c
     allreduce-ops.c
 )
