@@ -138,8 +138,8 @@ static inline void quantize_block_f32_q8_1_s16_tiled(float * restrict x, uint8_t
     quantize_block_f32_q8_1_tiled_impl(x, y_block, true, x_sb);
 }
 
-// isums: also store the per-block sum of the int8 quants (|sum of 32 int8| <= 4064) as int16 in the odd halfwords
-// of the scale vector; the fp16 scale stays in the even halfwords, which is all the scale readers use
+// isums (q8_0s, 10 vectors per block): the scale is also stored as f32 and the per-block sum of the int8 quants as
+// int32, each replicated over the 32 lanes, so the dot kernels read both without conversions
 static inline void quantize_block_f32_q8_0_tiled_impl(float * restrict x, uint8_t * restrict y_block, const bool isums) {
     assert((unsigned long) x % 128 == 0);
     assert((unsigned long) y_block % 128 == 0);
@@ -229,12 +229,7 @@ static inline void quantize_block_f32_q8_0_tiled_impl(float * restrict x, uint8_
         HVX_Vector r6 = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act, 24), v_repl_ctrl);
         HVX_Vector r7 = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act, 28), v_repl_ctrl);
 
-        if (isums) {
-            r_scale = Q6_V_vor_VV(Q6_V_vand_VV(r_scale, Q6_V_vsplat_R(0x0000FFFF)),
-                                  Q6_V_vsplat_R((uint32_t) ws[8 * b] << 16));
-        }
-
-        HVX_Vector * restrict dst = (HVX_Vector *) (y_block + b * 1152);
+        HVX_Vector * restrict dst = (HVX_Vector *) (y_block + b * (isums ? HTP_MM_ACT_TILE_SIZE_Q8_0S : HTP_MM_ACT_TILE_SIZE_Q8_0));
         dst[0] = r0;
         dst[1] = r1;
         dst[2] = r2;
@@ -244,6 +239,10 @@ static inline void quantize_block_f32_q8_0_tiled_impl(float * restrict x, uint8_
         dst[6] = r6;
         dst[7] = r7;
         dst[8] = r_scale;
+        if (isums) {
+            dst[8] = Q6_V_lo_W(hvx_vec_f16_to_f32_shuff(r_scale));  // same fp16 scale, as f32
+            dst[9] = Q6_V_vsplat_R((uint32_t) ws[8 * b]);
+        }
     }
 }
 
@@ -273,7 +272,7 @@ static void quantize_row_f32_q8_0s_tiled(float * restrict x, uint8_t * restrict 
     const uint32_t nb = (k + qk - 1) / qk;
 
     for (uint32_t i = 0; i < nb; i++) {
-        uint8_t * restrict y_block = y + i * 4 * 1152;
+        uint8_t * restrict y_block = y + i * 4 * HTP_MM_ACT_TILE_SIZE_Q8_0S;
         quantize_block_f32_q8_0s_tiled(x + i * qk, y_block);
     }
 }
@@ -444,9 +443,9 @@ static inline HVX_Vector unpack_q1_0_bits(HVX_Vector v_plane, int g, HVX_Vector 
     return Q6_V_vand_VV(v_plane, mask_01);
 }
 
-// sum(q) of a 32-k act block: int16 in the odd halfwords of the scale vector
+// q8_0s act block: vector 8 = f32 scale, vector 9 = int32 sum of the 32 int8 quants (both replicated per lane)
 static inline HVX_Vector q8_0s_act_sum(const HVX_Vector * restrict v_act) {
-    return Q6_Vw_vasr_VwR(v_act[8], 16);
+    return v_act[9];
 }
 
 static inline HVX_Vector accum_q1_0_32x1(
@@ -986,9 +985,9 @@ static void tiled_vec_dot_q1_0_32x1(const uint32_t n, float * restrict s, const 
 
         #pragma unroll
         for (int quarter = 0; quarter < 4; quarter++) {
-            const HVX_Vector * restrict v_act = (const HVX_Vector *) (y_q + (4 * kt + quarter) * HTP_MM_ACT_TILE_SIZE_Q8_0);
+            const HVX_Vector * restrict v_act = (const HVX_Vector *) (y_q + (4 * kt + quarter) * HTP_MM_ACT_TILE_SIZE_Q8_0S);
             HVX_Vector v_sum_sf = Q6_Vsf_equals_Vw(accum_q1_0_32x1(vptr[quarter], v_act, v_mask_01));
-            HVX_Vector v_da_sf  = Q6_V_lo_W(hvx_vec_f16_to_f32_shuff(v_act[8]));
+            HVX_Vector v_da_sf  = v_act[8];
             HVX_Vector v_q_qf   = Q6_Vqf32_vmpy_VsfVsf(v_sum_sf, v_da_sf);
             v_tile_qf = (quarter == 0) ? v_q_qf : Q6_Vqf32_vadd_Vqf32Vqf32(v_tile_qf, v_q_qf);
         }
@@ -1053,10 +1052,10 @@ static void tiled_vec_dot_q1_0_32x1_x2(const uint32_t n, float * restrict s0, fl
 
         #pragma unroll
         for (int quarter = 0; quarter < 4; quarter++) {
-            const HVX_Vector * restrict v_act = (const HVX_Vector *) (y_q + (4 * kt + quarter) * HTP_MM_ACT_TILE_SIZE_Q8_0);
+            const HVX_Vector * restrict v_act = (const HVX_Vector *) (y_q + (4 * kt + quarter) * HTP_MM_ACT_TILE_SIZE_Q8_0S);
             HVX_Vector v_dot0, v_dot1;
             accum_q1_0_32x1_x2(vptr0[quarter], vptr1[quarter], v_act, v_mask_01, &v_dot0, &v_dot1);
-            HVX_Vector v_da_sf = Q6_V_lo_W(hvx_vec_f16_to_f32_shuff(v_act[8]));
+            HVX_Vector v_da_sf = v_act[8];
             HVX_Vector v_q_qf0 = Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vw(v_dot0), v_da_sf);
             HVX_Vector v_q_qf1 = Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vw(v_dot1), v_da_sf);
             v_tile_qf0 = (quarter == 0) ? v_q_qf0 : Q6_Vqf32_vadd_Vqf32Vqf32(v_tile_qf0, v_q_qf0);
@@ -1100,13 +1099,13 @@ static void tiled_vec_dot_q1_0_32x2(const uint32_t n, float * restrict s0, float
 
         for (int quarter = 0; quarter < 4; quarter++) {
             const uint32_t act_tile = 4 * kt + quarter;
-            const HVX_Vector * restrict v_act0 = (const HVX_Vector *) (y0_q + act_tile * HTP_MM_ACT_TILE_SIZE_Q8_0);
-            const HVX_Vector * restrict v_act1 = (const HVX_Vector *) (y1_q + act_tile * HTP_MM_ACT_TILE_SIZE_Q8_0);
+            const HVX_Vector * restrict v_act0 = (const HVX_Vector *) (y0_q + act_tile * HTP_MM_ACT_TILE_SIZE_Q8_0S);
+            const HVX_Vector * restrict v_act1 = (const HVX_Vector *) (y1_q + act_tile * HTP_MM_ACT_TILE_SIZE_Q8_0S);
             HVX_VectorPair v_sums = accum_q1_0_32x2(vptr[quarter], v_act0, v_act1, v_mask_01);
             HVX_Vector v_sum_sf_c0 = Q6_Vsf_equals_Vw(Q6_V_lo_W(v_sums));
             HVX_Vector v_sum_sf_c1 = Q6_Vsf_equals_Vw(Q6_V_hi_W(v_sums));
-            HVX_Vector v_da_sf_c0  = Q6_V_lo_W(hvx_vec_f16_to_f32_shuff(v_act0[8]));
-            HVX_Vector v_da_sf_c1  = Q6_V_lo_W(hvx_vec_f16_to_f32_shuff(v_act1[8]));
+            HVX_Vector v_da_sf_c0  = v_act0[8];
+            HVX_Vector v_da_sf_c1  = v_act1[8];
 
             v_tile_qf_c0 = Q6_Vqf32_vadd_Vqf32Vqf32(v_tile_qf_c0, Q6_Vqf32_vmpy_VsfVsf(v_sum_sf_c0, v_da_sf_c0));
             v_tile_qf_c1 = Q6_Vqf32_vadd_Vqf32Vqf32(v_tile_qf_c1, Q6_Vqf32_vmpy_VsfVsf(v_sum_sf_c1, v_da_sf_c1));
@@ -2145,7 +2144,7 @@ static inline void quantize_f32_q8_0s_tiled_block_kernel(
 
     for (uint32_t ib = ib_first; ib < ib_last; ++ib) {
         const float * restrict src_ptr = (const float *) ((const uint8_t *) src + r * src_row_size + c * qk * sizeof(float));
-        uint8_t * restrict dst_ptr = dst + r * dst_row_size + c * 4 * 1152;
+        uint8_t * restrict dst_ptr = dst + r * dst_row_size + c * 4 * HTP_MM_ACT_TILE_SIZE_Q8_0S;
 
         quantize_block_f32_q8_0s_tiled((float *) src_ptr, dst_ptr);
 

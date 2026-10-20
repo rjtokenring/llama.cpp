@@ -704,7 +704,7 @@ static void name(unsigned int nth, unsigned int ith, void * data) {             
 }
 
 QUANTIZE_IMPL(quantize_f32_q8_0_tiled,     "quantize-f32-q8_0_tiled",     quantize_f32_q8_0_tiled_kernel,     htp_mm_q8_0_tiled_row_size(ne0))
-QUANTIZE_IMPL(quantize_f32_q8_0s_tiled,    "quantize-f32-q8_0s_tiled",    quantize_f32_q8_0s_tiled_kernel,    htp_mm_q8_0_tiled_row_size(ne0))
+QUANTIZE_IMPL(quantize_f32_q8_0s_tiled,    "quantize-f32-q8_0s_tiled",    quantize_f32_q8_0s_tiled_kernel,    htp_mm_q8_1_tiled_row_size(ne0))
 QUANTIZE_IMPL(quantize_f32_q8_1_tiled,     "quantize-f32-q8_1_tiled",     quantize_f32_q8_1_tiled_kernel,     htp_mm_q8_1_tiled_row_size(ne0))
 QUANTIZE_IMPL(quantize_f32_q8_1_s16_tiled, "quantize-f32-q8_1_s16_tiled", quantize_f32_q8_1_s16_tiled_kernel, htp_mm_q8_1_tiled_row_size(ne0))
 QUANTIZE_IMPL(quantize_f32_f16_tiled,      "quantize-f32-f16_tiled",      quantize_f32_f16_tiled_kernel,      htp_mm_f16_tiled_row_size(ne0))
@@ -761,7 +761,7 @@ static void quantize_f32_q8_0s_tiled_block(unsigned int nth, unsigned int ith, v
         mmctx->quant_ib_first[ith],
         mmctx->quant_ib_last[ith],
         mmctx->vtcm_act_raw_stride,
-        htp_mm_q8_0_tiled_row_size(src->ne[0]),
+        htp_mm_q8_1_tiled_row_size(src->ne[0]),
         mmctx->quant_r[ith],
         mmctx->quant_c[ith]
     );
