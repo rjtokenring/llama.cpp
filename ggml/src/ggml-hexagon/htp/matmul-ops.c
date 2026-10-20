@@ -99,8 +99,8 @@ struct htp_mm_context {
          const void * restrict vy0, const void * restrict vy1, uint32_t valid_rows,
          const float * restrict sz0, const float * restrict sz1);
 
-    // Optional: two weight row tiles against one activation column (act vectors loaded once per k-group)
-    void (*vec_dot_32x1_x2)(const uint32_t n, float * restrict s0, float * restrict s1,
+    // Optional: 64 rows (two row tiles) against one activation column
+    void (*vec_dot_64x1)(const uint32_t n, float * restrict s0, float * restrict s1,
          const void * restrict vx0, const void * restrict vx1,
          const void * restrict vy, uint32_t valid_rows0, uint32_t valid_rows1,
          const float * restrict sz0, const float * restrict sz1);
@@ -415,49 +415,35 @@ static void hvx_mv_2d_tiled(unsigned int nth, unsigned int ith, void * data) {
     }
 
     for (uint32_t ct = ct_start; ct < ct_end; ) {
-        if (mmctx->vec_dot_32x1_x2 && ct + 1 < ct_end) {
-            // two row tiles per pass over the activation (both are already queued: n_prefetch >= 2)
-            const uint8_t * w_tile0 = (void *) dma_queue_pop(dma_q).dst;
-            const uint8_t * w_tile1 = (void *) dma_queue_pop(dma_q).dst;
+        // 64x1: two row tiles per pass over the activation (both are queued already, n_prefetch >= 2)
+        const bool pair = mmctx->vec_dot_64x1 && ct + 1 < ct_end;
 
-            int valid_rows0 = MIN(32, MAX(0, (int)ne0 - (int)(ct * 32)));
-            int valid_rows1 = MIN(32, MAX(0, (int)ne0 - (int)((ct + 1) * 32)));
+        const uint8_t * w_tile0 = (void *) dma_queue_pop(dma_q).dst;
+        const uint8_t * w_tile1 = pair ? (void *) dma_queue_pop(dma_q).dst : NULL;
 
-            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
-            mmctx->vec_dot_32x1_x2(ne10, &tmp[ct * 32 - src0_start_row], &tmp[(ct + 1) * 32 - src0_start_row],
-                                   w_tile0, w_tile1, act_col, valid_rows0, valid_rows1, NULL, NULL);
-            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
-
-            if (push_ct < ct_end) {
-                dma_queue_push(dma_q, dma_make_data(w_tile0, src0_row + push_ct * tile_row_stride),
-                               aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
-                push_ct++;
-            }
-            if (push_ct < ct_end) {
-                dma_queue_push(dma_q, dma_make_data(w_tile1, src0_row + push_ct * tile_row_stride),
-                               aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
-                push_ct++;
-            }
-            ct += 2;
-            continue;
-        }
-
-        const uint8_t * w_tile = (void *) dma_queue_pop(dma_q).dst;
-
-        float * dst_ptr = &tmp[ct * 32 - src0_start_row];
-        int valid_rows = (int)ne0 - (int)(ct * 32);
-        valid_rows = MIN(32, MAX(0, valid_rows));
+        float * dst_ptr0 = &tmp[ct * 32 - src0_start_row];
+        int valid_rows0 = MIN(32, MAX(0, (int)ne0 - (int)(ct * 32)));
+        int valid_rows1 = MIN(32, MAX(0, (int)ne0 - (int)((ct + 1) * 32)));
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
-        mmctx->vec_dot_32x1(ne10, dst_ptr, w_tile, act_col, valid_rows, NULL);
+        if (pair) {
+            mmctx->vec_dot_64x1(ne10, dst_ptr0, dst_ptr0 + 32, w_tile0, w_tile1, act_col, valid_rows0, valid_rows1, NULL, NULL);
+        } else {
+            mmctx->vec_dot_32x1(ne10, dst_ptr0, w_tile0, act_col, valid_rows0, NULL);
+        }
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
 
         if (push_ct < ct_end) {
-            dma_queue_push(dma_q, dma_make_data(w_tile, src0_row + push_ct * tile_row_stride),
+            dma_queue_push(dma_q, dma_make_data(w_tile0, src0_row + push_ct * tile_row_stride),
                            aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
             push_ct++;
         }
-        ct++;
+        if (pair && push_ct < ct_end) {
+            dma_queue_push(dma_q, dma_make_data(w_tile1, src0_row + push_ct * tile_row_stride),
+                           aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
+            push_ct++;
+        }
+        ct += pair ? 2 : 1;
     }
 
     int copy_cnt = (int)MIN(src0_end_row, ne0) - (int)src0_start_row;
@@ -538,66 +524,53 @@ static void hvx_mm_nx_2d_tiled(unsigned int nth, unsigned int ith, void * data) 
         }
 
         for (uint32_t ct = ct_start; ct < ct_end; ) {
-            if (act_nrows == 1 && mmctx->vec_dot_32x1_x2 && ct + 1 < ct_end) {
-                // two row tiles per pass over the activation (both are already queued: n_prefetch >= 2)
-                const uint8_t * w_tile0 = (void *) dma_queue_pop(dma_q).dst;
-                const uint8_t * w_tile1 = (void *) dma_queue_pop(dma_q).dst;
+            // 64x1: two row tiles per pass over the activation (both are queued already, n_prefetch >= 2)
+            const bool pair = act_nrows == 1 && mmctx->vec_dot_64x1 && ct + 1 < ct_end;
 
-                int valid_rows0 = MIN(32, MAX(0, (int)dst->ne[0] - (int)(ct * 32)));
-                int valid_rows1 = MIN(32, MAX(0, (int)dst->ne[0] - (int)((ct + 1) * 32)));
-                float * restrict dst_row = (float *) dst->data;
+            const uint8_t * w_tile0 = (void *) dma_queue_pop(dma_q).dst;
+            const uint8_t * w_tile1 = pair ? (void *) dma_queue_pop(dma_q).dst : NULL;
 
-                htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
-                mmctx->vec_dot_32x1_x2(ne10, &dst_row[ct * 32], &dst_row[(ct + 1) * 32], w_tile0, w_tile1,
-                                       act_data, valid_rows0, valid_rows1, NULL, NULL);
-                htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
-
-                if (push_ct < ct_end) {
-                    dma_queue_push(dma_q, dma_make_data(w_tile0, src_w_row + push_ct * tile_row_stride),
-                                    aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
-                    push_ct++;
-                }
-                if (push_ct < ct_end) {
-                    dma_queue_push(dma_q, dma_make_data(w_tile1, src_w_row + push_ct * tile_row_stride),
-                                    aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
-                    push_ct++;
-                }
-                ct += 2;
-                continue;
-            }
-
-            const uint8_t * w_tile = (void *) dma_queue_pop(dma_q).dst;
-            int valid_rows = (int)dst->ne[0] - (int)(ct * 32);
-            valid_rows = MIN(32, MAX(0, valid_rows));
+            int valid_rows0 = MIN(32, MAX(0, (int)dst->ne[0] - (int)(ct * 32)));
+            int valid_rows1 = MIN(32, MAX(0, (int)dst->ne[0] - (int)((ct + 1) * 32)));
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
-            uint32_t ir1 = 0;
-            for (; ir1 + 1 < act_nrows; ir1 += 2) {
-                const uint8_t * restrict act_col0 = (const uint8_t *) (act_data + (ir1+0) * act_stride);
-                const uint8_t * restrict act_col1 = (const uint8_t *) (act_data + (ir1+1) * act_stride);
+            if (pair) {
+                float * dst_ptr0 = &((float *) dst->data)[ct * 32];
+                mmctx->vec_dot_64x1(ne10, dst_ptr0, dst_ptr0 + 32, w_tile0, w_tile1, act_data, valid_rows0, valid_rows1, NULL, NULL);
+            } else {
+                uint32_t ir1 = 0;
+                for (; ir1 + 1 < act_nrows; ir1 += 2) {
+                    const uint8_t * restrict act_col0 = (const uint8_t *) (act_data + (ir1+0) * act_stride);
+                    const uint8_t * restrict act_col1 = (const uint8_t *) (act_data + (ir1+1) * act_stride);
 
-                float * restrict dst_row0 = (float *) (dst->data + ((ir1+0) * dst_row_size));
-                float * restrict dst_row1 = (float *) (dst->data + ((ir1+1) * dst_row_size));
-                float * dst_ptr0 = &dst_row0[ct * 32];
-                float * dst_ptr1 = &dst_row1[ct * 32];
+                    float * restrict dst_row0 = (float *) (dst->data + ((ir1+0) * dst_row_size));
+                    float * restrict dst_row1 = (float *) (dst->data + ((ir1+1) * dst_row_size));
+                    float * dst_ptr0 = &dst_row0[ct * 32];
+                    float * dst_ptr1 = &dst_row1[ct * 32];
 
-                mmctx->vec_dot_32x2(ne10, dst_ptr0, dst_ptr1, w_tile, act_col0, act_col1, valid_rows, NULL, NULL);
-            }
+                    mmctx->vec_dot_32x2(ne10, dst_ptr0, dst_ptr1, w_tile0, act_col0, act_col1, valid_rows0, NULL, NULL);
+                }
 
-            for (; ir1 < act_nrows; ++ir1) {
-                const uint8_t * restrict act_col = (const uint8_t *) (act_data + ir1 * act_stride);
-                float * restrict dst_row = (float *) (dst->data + (ir1 * dst_row_size));
-                float * dst_ptr = &dst_row[ct * 32];
-                mmctx->vec_dot_32x1(ne10, dst_ptr, w_tile, act_col, valid_rows, NULL);
+                for (; ir1 < act_nrows; ++ir1) {
+                    const uint8_t * restrict act_col = (const uint8_t *) (act_data + ir1 * act_stride);
+                    float * restrict dst_row = (float *) (dst->data + (ir1 * dst_row_size));
+                    float * dst_ptr = &dst_row[ct * 32];
+                    mmctx->vec_dot_32x1(ne10, dst_ptr, w_tile0, act_col, valid_rows0, NULL);
+                }
             }
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
 
             if (push_ct < ct_end) {
-                dma_queue_push(dma_q, dma_make_data(w_tile, src_w_row + push_ct * tile_row_stride),
+                dma_queue_push(dma_q, dma_make_data(w_tile0, src_w_row + push_ct * tile_row_stride),
                                 aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
                 push_ct++;
             }
-            ct++;
+            if (pair && push_ct < ct_end) {
+                dma_queue_push(dma_q, dma_make_data(w_tile1, src_w_row + push_ct * tile_row_stride),
+                                aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
+                push_ct++;
+            }
+            ct += pair ? 2 : 1;
         }
     }
 }
@@ -882,7 +855,7 @@ static void quantize_f16_f16_tiled_block(unsigned int nth, unsigned int ith, voi
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
 }
 
-// q8_1 for weight types with offsets (q8_1_s16 for Q2_K), f16_tiled for F16, otherwise q8_0
+// q8_1 for weight types with offsets (q8_1_s16 for Q2_K), q8_0s for 1-bit weights, f16_tiled for F16, otherwise q8_0
 static inline worker_callback_t htp_mm_act_quant_row_func(int weight_type, int act_type) {
     if (weight_type == HTP_TYPE_F16) {
         return (act_type == HTP_TYPE_F16) ? quantize_f16_f16_tiled : quantize_f32_f16_tiled;
@@ -890,7 +863,7 @@ static inline worker_callback_t htp_mm_act_quant_row_func(int weight_type, int a
     if (weight_type == HTP_TYPE_Q2_K) {
         return quantize_f32_q8_1_s16_tiled;
     }
-    if (weight_type == HTP_TYPE_Q1_0) {
+    if (htp_mm_weight_has_sums(weight_type)) {
         return quantize_f32_q8_0s_tiled;
     }
     return htp_mm_weight_has_offset(weight_type) ? quantize_f32_q8_1_tiled : quantize_f32_q8_0_tiled;
@@ -903,7 +876,7 @@ static inline worker_callback_t htp_mm_act_quant_block_func(int weight_type, int
     if (weight_type == HTP_TYPE_Q2_K) {
         return quantize_f32_q8_1_s16_tiled_block;
     }
-    if (weight_type == HTP_TYPE_Q1_0) {
+    if (htp_mm_weight_has_sums(weight_type)) {
         return quantize_f32_q8_0s_tiled_block;
     }
     return htp_mm_weight_has_offset(weight_type) ? quantize_f32_q8_1_tiled_block : quantize_f32_q8_0_tiled_block;
@@ -1798,10 +1771,10 @@ static int hvx_mm_init_tiled_vec_dot(struct htp_mm_context * mmctx, enum htp_dat
             mmctx->vec_dot_32x2 = tiled_vec_dot_mxfp4_32x2;
             return 0;
         case HTP_TYPE_Q1_0:
-            mmctx->type            = "q1_0_tiled-f32";
-            mmctx->vec_dot_32x1    = tiled_vec_dot_q1_0_32x1;
-            mmctx->vec_dot_32x2    = tiled_vec_dot_q1_0_32x2;
-            mmctx->vec_dot_32x1_x2 = tiled_vec_dot_q1_0_32x1_x2;
+            mmctx->type         = "q1_0_tiled-f32";
+            mmctx->vec_dot_32x1 = tiled_vec_dot_q1_0_32x1;
+            mmctx->vec_dot_32x2 = tiled_vec_dot_q1_0_32x2;
+            mmctx->vec_dot_64x1 = tiled_vec_dot_q1_0_64x1;
             return 0;
         case HTP_TYPE_F16:
             mmctx->type         = "f16_tiled-f16";
