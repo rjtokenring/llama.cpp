@@ -99,6 +99,12 @@ struct htp_mm_context {
          const void * restrict vy0, const void * restrict vy1, uint32_t valid_rows,
          const float * restrict sz0, const float * restrict sz1);
 
+    // Optional: two weight row tiles against one activation column (act vectors loaded once per k-group)
+    void (*vec_dot_32x1_x2)(const uint32_t n, float * restrict s0, float * restrict s1,
+         const void * restrict vx0, const void * restrict vx1,
+         const void * restrict vy, uint32_t valid_rows0, uint32_t valid_rows1,
+         const float * restrict sz0, const float * restrict sz1);
+
     // Precomputed values
     uint32_t src0_nrows_per_thread;
     uint32_t src0_row_start;
@@ -408,7 +414,34 @@ static void hvx_mv_2d_tiled(unsigned int nth, unsigned int ith, void * data) {
         return;
     }
 
-    for (uint32_t ct = ct_start; ct < ct_end; ct++) {
+    for (uint32_t ct = ct_start; ct < ct_end; ) {
+        if (mmctx->vec_dot_32x1_x2 && ct + 1 < ct_end) {
+            // two row tiles per pass over the activation (both are already queued: n_prefetch >= 2)
+            const uint8_t * w_tile0 = (void *) dma_queue_pop(dma_q).dst;
+            const uint8_t * w_tile1 = (void *) dma_queue_pop(dma_q).dst;
+
+            int valid_rows0 = MIN(32, MAX(0, (int)ne0 - (int)(ct * 32)));
+            int valid_rows1 = MIN(32, MAX(0, (int)ne0 - (int)((ct + 1) * 32)));
+
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+            mmctx->vec_dot_32x1_x2(ne10, &tmp[ct * 32 - src0_start_row], &tmp[(ct + 1) * 32 - src0_start_row],
+                                   w_tile0, w_tile1, act_col, valid_rows0, valid_rows1, NULL, NULL);
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+
+            if (push_ct < ct_end) {
+                dma_queue_push(dma_q, dma_make_data(w_tile0, src0_row + push_ct * tile_row_stride),
+                               aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
+                push_ct++;
+            }
+            if (push_ct < ct_end) {
+                dma_queue_push(dma_q, dma_make_data(w_tile1, src0_row + push_ct * tile_row_stride),
+                               aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
+                push_ct++;
+            }
+            ct += 2;
+            continue;
+        }
+
         const uint8_t * w_tile = (void *) dma_queue_pop(dma_q).dst;
 
         float * dst_ptr = &tmp[ct * 32 - src0_start_row];
@@ -424,6 +457,7 @@ static void hvx_mv_2d_tiled(unsigned int nth, unsigned int ith, void * data) {
                            aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
             push_ct++;
         }
+        ct++;
     }
 
     int copy_cnt = (int)MIN(src0_end_row, ne0) - (int)src0_start_row;
@@ -503,7 +537,35 @@ static void hvx_mm_nx_2d_tiled(unsigned int nth, unsigned int ith, void * data) 
                             src_w_row + push_ct * tile_row_stride), aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
         }
 
-        for (uint32_t ct = ct_start; ct < ct_end; ct++) {
+        for (uint32_t ct = ct_start; ct < ct_end; ) {
+            if (act_nrows == 1 && mmctx->vec_dot_32x1_x2 && ct + 1 < ct_end) {
+                // two row tiles per pass over the activation (both are already queued: n_prefetch >= 2)
+                const uint8_t * w_tile0 = (void *) dma_queue_pop(dma_q).dst;
+                const uint8_t * w_tile1 = (void *) dma_queue_pop(dma_q).dst;
+
+                int valid_rows0 = MIN(32, MAX(0, (int)dst->ne[0] - (int)(ct * 32)));
+                int valid_rows1 = MIN(32, MAX(0, (int)dst->ne[0] - (int)((ct + 1) * 32)));
+                float * restrict dst_row = (float *) dst->data;
+
+                htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+                mmctx->vec_dot_32x1_x2(ne10, &dst_row[ct * 32], &dst_row[(ct + 1) * 32], w_tile0, w_tile1,
+                                       act_data, valid_rows0, valid_rows1, NULL, NULL);
+                htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+
+                if (push_ct < ct_end) {
+                    dma_queue_push(dma_q, dma_make_data(w_tile0, src_w_row + push_ct * tile_row_stride),
+                                    aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
+                    push_ct++;
+                }
+                if (push_ct < ct_end) {
+                    dma_queue_push(dma_q, dma_make_data(w_tile1, src_w_row + push_ct * tile_row_stride),
+                                    aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
+                    push_ct++;
+                }
+                ct += 2;
+                continue;
+            }
+
             const uint8_t * w_tile = (void *) dma_queue_pop(dma_q).dst;
             int valid_rows = (int)dst->ne[0] - (int)(ct * 32);
             valid_rows = MIN(32, MAX(0, valid_rows));
@@ -535,6 +597,7 @@ static void hvx_mm_nx_2d_tiled(unsigned int nth, unsigned int ith, void * data) 
                                 aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
                 push_ct++;
             }
+            ct++;
         }
     }
 }
@@ -642,6 +705,7 @@ static void name(unsigned int nth, unsigned int ith, void * data) {             
 }
 
 QUANTIZE_IMPL(quantize_f32_q8_0_tiled,     "quantize-f32-q8_0_tiled",     quantize_f32_q8_0_tiled_kernel,     htp_mm_q8_0_tiled_row_size(ne0))
+QUANTIZE_IMPL(quantize_f32_q8_0s_tiled,    "quantize-f32-q8_0s_tiled",    quantize_f32_q8_0s_tiled_kernel,    htp_mm_q8_0_tiled_row_size(ne0))
 QUANTIZE_IMPL(quantize_f32_q8_1_tiled,     "quantize-f32-q8_1_tiled",     quantize_f32_q8_1_tiled_kernel,     htp_mm_q8_1_tiled_row_size(ne0))
 QUANTIZE_IMPL(quantize_f32_q8_1_s16_tiled, "quantize-f32-q8_1_s16_tiled", quantize_f32_q8_1_s16_tiled_kernel, htp_mm_q8_1_tiled_row_size(ne0))
 QUANTIZE_IMPL(quantize_f32_f16_tiled,      "quantize-f32-f16_tiled",      quantize_f32_f16_tiled_kernel,      htp_mm_f16_tiled_row_size(ne0))
@@ -663,6 +727,34 @@ static void quantize_f32_q8_0_tiled_block(unsigned int nth, unsigned int ith, vo
     const struct htp_tensor * src = mmctx->act;
 
     quantize_f32_q8_0_tiled_block_kernel(
+        (const float *) mmctx->vtcm_act_raw,
+        mmctx->vtcm_act,
+        NULL,
+        src->ne[0],
+        mmctx->quant_ib_first[ith],
+        mmctx->quant_ib_last[ith],
+        mmctx->vtcm_act_raw_stride,
+        htp_mm_q8_0_tiled_row_size(src->ne[0]),
+        mmctx->quant_r[ith],
+        mmctx->quant_c[ith]
+    );
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
+}
+
+static void quantize_f32_q8_0s_tiled_block(unsigned int nth, unsigned int ith, void * data) {
+    (void) nth;
+    struct htp_mm_context * mmctx = data;
+    if (mmctx->quant_ib_first[ith] >= mmctx->quant_ib_last[ith]) {
+        return;
+    }
+    struct htp_ops_context * octx = mmctx->octx;
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
+
+    const struct htp_tensor * src = mmctx->act;
+
+    quantize_f32_q8_0s_tiled_block_kernel(
         (const float *) mmctx->vtcm_act_raw,
         mmctx->vtcm_act,
         NULL,
@@ -798,6 +890,9 @@ static inline worker_callback_t htp_mm_act_quant_row_func(int weight_type, int a
     if (weight_type == HTP_TYPE_Q2_K) {
         return quantize_f32_q8_1_s16_tiled;
     }
+    if (weight_type == HTP_TYPE_Q1_0) {
+        return quantize_f32_q8_0s_tiled;
+    }
     return htp_mm_weight_has_offset(weight_type) ? quantize_f32_q8_1_tiled : quantize_f32_q8_0_tiled;
 }
 
@@ -807,6 +902,9 @@ static inline worker_callback_t htp_mm_act_quant_block_func(int weight_type, int
     }
     if (weight_type == HTP_TYPE_Q2_K) {
         return quantize_f32_q8_1_s16_tiled_block;
+    }
+    if (weight_type == HTP_TYPE_Q1_0) {
+        return quantize_f32_q8_0s_tiled_block;
     }
     return htp_mm_weight_has_offset(weight_type) ? quantize_f32_q8_1_tiled_block : quantize_f32_q8_0_tiled_block;
 }
@@ -1700,9 +1798,10 @@ static int hvx_mm_init_tiled_vec_dot(struct htp_mm_context * mmctx, enum htp_dat
             mmctx->vec_dot_32x2 = tiled_vec_dot_mxfp4_32x2;
             return 0;
         case HTP_TYPE_Q1_0:
-            mmctx->type         = "q1_0_tiled-f32";
-            mmctx->vec_dot_32x1 = tiled_vec_dot_q1_0_32x1;
-            mmctx->vec_dot_32x2 = tiled_vec_dot_q1_0_32x2;
+            mmctx->type            = "q1_0_tiled-f32";
+            mmctx->vec_dot_32x1    = tiled_vec_dot_q1_0_32x1;
+            mmctx->vec_dot_32x2    = tiled_vec_dot_q1_0_32x2;
+            mmctx->vec_dot_32x1_x2 = tiled_vec_dot_q1_0_32x1_x2;
             return 0;
         case HTP_TYPE_F16:
             mmctx->type         = "f16_tiled-f16";
