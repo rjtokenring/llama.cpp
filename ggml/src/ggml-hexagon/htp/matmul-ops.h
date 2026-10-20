@@ -28,6 +28,7 @@ extern "C" {
 #define HTP_MM_ACT_BLOCK_K             128
 #define HTP_MM_ACT_TILE_SIZE_Q8_0      1152
 #define HTP_MM_ACT_TILE_SIZE_Q8_1      1280
+#define HTP_MM_ACT_TILE_SIZE_Q8_0S     1280  // q8_0 act tile + f32 scale and int32 block sum vectors (Q1_0 weights)
 #define HTP_MM_ACT_TILE_SIZE_F16       2048
 
 #define HTP_MM_MAX_PREFETCH 16
@@ -210,6 +211,9 @@ static inline size_t htp_mm_f16_tiled_row_size(uint32_t ne) {
 static inline size_t htp_mm_tiled_act_row_size(int weight_type, uint32_t ne) {
     if (weight_type == HTP_TYPE_F16) {
         return htp_mm_f16_tiled_row_size(ne);
+    }
+    if (weight_type == HTP_TYPE_Q1_0) {
+        return htp_mm_q8_1_tiled_row_size(ne);  // q8_0s: same size as q8_1
     }
     return htp_mm_weight_has_offset(weight_type) ? htp_mm_q8_1_tiled_row_size(ne) : htp_mm_q8_0_tiled_row_size(ne);
 }
