@@ -145,7 +145,7 @@ Block-32 formats use a tile size of 32 rows x 32 columns (`K_cols = 32`):
   - HMX systolic array processes the 4 resulting 32x32 FP16 tiles over 4 compute steps along K.
 
 - **HVX Vector Dot-Product**:
-  - The activations are quantized into `q8_0s` tiles (`HTP_MM_ACT_TILE_SIZE_Q8_0S`, 1280 bytes per 32 columns): the 8 replicated Q8_0 vectors, then the block scale as F32 (vector 8) and the sum of the 32 int8 quants as int32 (vector 9), both replicated per lane.
+  - The activations are quantized into `q8_0_s32` tiles (`HTP_MM_ACT_TILE_SIZE_Q8_0_S32`, 1280 bytes per 32 columns): the 8 replicated Q8_0 vectors, then the block scale as F32 (vector 8) and the sum of the 32 int8 quants as int32 (vector 9), both replicated per lane.
   - `tiled_vec_dot_q1_0_32x1`, `tiled_vec_dot_q1_0_64x1` and `tiled_vec_dot_q1_0_32x2` extract bit `g` of each plane byte as unsigned bytes {0,1} (`unpack_q1_0_bits`) and use `Q6_Vw_vrmpy_VubVb` with one independent product per k-group; with `w = 2b - 1` the group dot is `2 * sum(b * q) - sum(q)` (`q1_0_dot_i32`).
   - `tiled_vec_dot_q1_0_64x1` processes two row tiles per pass over the activation column (`vec_dot_64x1`, used by the mat-vec drivers when at least two row tiles remain).
 

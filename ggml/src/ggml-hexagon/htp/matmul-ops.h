@@ -28,7 +28,7 @@ extern "C" {
 #define HTP_MM_ACT_BLOCK_K             128
 #define HTP_MM_ACT_TILE_SIZE_Q8_0      1152
 #define HTP_MM_ACT_TILE_SIZE_Q8_1      1280
-#define HTP_MM_ACT_TILE_SIZE_Q8_0S     1280  // q8_0 + vector 8: f32 scale, vector 9: int32 block sum (replicated per lane)
+#define HTP_MM_ACT_TILE_SIZE_Q8_0_S32     1280  // q8_0 + vector 8: f32 scale, vector 9: int32 block sum (replicated per lane)
 #define HTP_MM_ACT_TILE_SIZE_F16       2048
 
 #define HTP_MM_MAX_PREFETCH 16
@@ -189,7 +189,7 @@ static inline bool htp_mm_weight_has_offset(int weight_type) {
            weight_type == HTP_TYPE_Q2_K || weight_type == HTP_TYPE_Q2_0;
 }
 
-// weight types whose dot is 2 * sum(b * q) - sum(q) (1-bit weights): the activations need integer block sums (q8_0s)
+// weight types whose dot is 2 * sum(b * q) - sum(q) (1-bit weights): the activations need integer block sums (q8_0_s32)
 static inline bool htp_mm_weight_has_sums(int weight_type) {
     return weight_type == HTP_TYPE_Q1_0;
 }
@@ -218,7 +218,7 @@ static inline size_t htp_mm_tiled_act_row_size(int weight_type, uint32_t ne) {
         return htp_mm_f16_tiled_row_size(ne);
     }
     if (htp_mm_weight_has_offset(weight_type) || htp_mm_weight_has_sums(weight_type)) {
-        return htp_mm_q8_1_tiled_row_size(ne);  // q8_1 and q8_0s have the same size
+        return htp_mm_q8_1_tiled_row_size(ne);  // q8_1 and q8_0_s32 have the same size
     }
     return htp_mm_q8_0_tiled_row_size(ne);
 }

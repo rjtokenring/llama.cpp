@@ -678,7 +678,7 @@ static void name(unsigned int nth, unsigned int ith, void * data) {             
 }
 
 QUANTIZE_IMPL(quantize_f32_q8_0_tiled,     "quantize-f32-q8_0_tiled",     quantize_f32_q8_0_tiled_kernel,     htp_mm_q8_0_tiled_row_size(ne0))
-QUANTIZE_IMPL(quantize_f32_q8_0s_tiled,    "quantize-f32-q8_0s_tiled",    quantize_f32_q8_0s_tiled_kernel,    htp_mm_q8_1_tiled_row_size(ne0))
+QUANTIZE_IMPL(quantize_f32_q8_0_s32_tiled,    "quantize-f32-q8_0_s32_tiled",    quantize_f32_q8_0_s32_tiled_kernel,    htp_mm_q8_1_tiled_row_size(ne0))
 QUANTIZE_IMPL(quantize_f32_q8_1_tiled,     "quantize-f32-q8_1_tiled",     quantize_f32_q8_1_tiled_kernel,     htp_mm_q8_1_tiled_row_size(ne0))
 QUANTIZE_IMPL(quantize_f32_q8_1_s16_tiled, "quantize-f32-q8_1_s16_tiled", quantize_f32_q8_1_s16_tiled_kernel, htp_mm_q8_1_tiled_row_size(ne0))
 QUANTIZE_IMPL(quantize_f32_f16_tiled,      "quantize-f32-f16_tiled",      quantize_f32_f16_tiled_kernel,      htp_mm_f16_tiled_row_size(ne0))
@@ -715,7 +715,7 @@ static void quantize_f32_q8_0_tiled_block(unsigned int nth, unsigned int ith, vo
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
 }
 
-static void quantize_f32_q8_0s_tiled_block(unsigned int nth, unsigned int ith, void * data) {
+static void quantize_f32_q8_0_s32_tiled_block(unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     struct htp_mm_context * mmctx = data;
     if (mmctx->quant_ib_first[ith] >= mmctx->quant_ib_last[ith]) {
@@ -727,7 +727,7 @@ static void quantize_f32_q8_0s_tiled_block(unsigned int nth, unsigned int ith, v
 
     const struct htp_tensor * src = mmctx->act;
 
-    quantize_f32_q8_0s_tiled_block_kernel(
+    quantize_f32_q8_0_s32_tiled_block_kernel(
         (const float *) mmctx->vtcm_act_raw,
         mmctx->vtcm_act,
         NULL,
@@ -855,7 +855,7 @@ static void quantize_f16_f16_tiled_block(unsigned int nth, unsigned int ith, voi
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
 }
 
-// q8_1 for weight types with offsets (q8_1_s16 for Q2_K), q8_0s for 1-bit weights, f16_tiled for F16, otherwise q8_0
+// q8_1 for weight types with offsets (q8_1_s16 for Q2_K), q8_0_s32 for 1-bit weights, f16_tiled for F16, otherwise q8_0
 static inline worker_callback_t htp_mm_act_quant_row_func(int weight_type, int act_type) {
     if (weight_type == HTP_TYPE_F16) {
         return (act_type == HTP_TYPE_F16) ? quantize_f16_f16_tiled : quantize_f32_f16_tiled;
@@ -864,7 +864,7 @@ static inline worker_callback_t htp_mm_act_quant_row_func(int weight_type, int a
         return quantize_f32_q8_1_s16_tiled;
     }
     if (htp_mm_weight_has_sums(weight_type)) {
-        return quantize_f32_q8_0s_tiled;
+        return quantize_f32_q8_0_s32_tiled;
     }
     return htp_mm_weight_has_offset(weight_type) ? quantize_f32_q8_1_tiled : quantize_f32_q8_0_tiled;
 }
@@ -877,7 +877,7 @@ static inline worker_callback_t htp_mm_act_quant_block_func(int weight_type, int
         return quantize_f32_q8_1_s16_tiled_block;
     }
     if (htp_mm_weight_has_sums(weight_type)) {
-        return quantize_f32_q8_0s_tiled_block;
+        return quantize_f32_q8_0_s32_tiled_block;
     }
     return htp_mm_weight_has_offset(weight_type) ? quantize_f32_q8_1_tiled_block : quantize_f32_q8_0_tiled_block;
 }
