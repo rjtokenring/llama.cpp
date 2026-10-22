@@ -1873,6 +1873,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        // a split whose nodes are all outside the branch picked by ggml_build_forward_select()
+        // has nothing to compute: skip it, and the copies of its inputs with it
+        bool split_computes = false;
+        for (int i = 0; i < split->graph.n_nodes && !split_computes; i++) {
+            split_computes = (split->graph.nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+        }
+        if (!split_computes) {
+            continue;
+        }
+
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {

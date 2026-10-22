@@ -5910,13 +5910,7 @@ static bool ggml_hexagon_supported_softmax(const struct ggml_hexagon_session * s
         }
     }
 
-    // Reject non-HVX-aligned sizes when ne[0] > HVX_F32_LANES
-    // The HVX softmax implementation has issues with tail handling for larger non-aligned sizes
-    // Small sizes (ne[0] <= 32) work correctly with tail-only processing
     const int64_t ne0 = src0->ne[0];
-    if (ne0 > 32 && (ne0 & (32 - 1)) != 0) {
-        return false;
-    }
 
     // HVX vector size constraints for softmax
     #define SOFTMAX_MAX_ROW_SIZE 131072  // 128K elements max for numerical precision
@@ -6310,7 +6304,7 @@ static bool ggml_hexagon_precompute_im2col_params(
             const uint32_t dst_row_bytes = hex_round_up((uint32_t) dst_row_bytes_raw, 256);
 
             struct htp_im2col_vtcm_layout layout;
-            htp_im2col_vtcm_layout_build(&layout, src_row_bytes, dst_row_bytes, n_threads);
+            htp_im2col_vtcm_layout_build(&layout, src_row_bytes, dst_row_bytes, n_threads, 256);
 
             if (vtcm_size == 0 || layout.total_bytes <= vtcm_size) {
                 kparams->kernel_type          = HTP_IM2COL_KERNEL_PATCHEMBED_DMA;
@@ -6362,14 +6356,19 @@ static bool ggml_hexagon_precompute_im2col_params(
         const uint32_t src_row_bytes = hex_round_up((uint32_t) src_row_bytes_raw, 256);
         const uint32_t dst_row_bytes = hex_round_up((uint32_t) dst_row_bytes_raw, 256);
 
+        // threads work on output-col blocks, so a single output row (1D) can use them all
+        const uint64_t nblocks     = (uint64_t) total_rows * ((OW + owb - 1) / owb);
+        const uint32_t blk_threads = (uint32_t) (nblocks < max_threads ? nblocks : max_threads);
+        const uint32_t scratch     = KH == 1 ? htp_im2col_gather_scratch_bytes(patch_stride) : 256;
+
         struct htp_im2col_vtcm_layout layout;
-        htp_im2col_vtcm_layout_build(&layout, src_row_bytes, dst_row_bytes, n_threads);
+        htp_im2col_vtcm_layout_build(&layout, src_row_bytes, dst_row_bytes, blk_threads, scratch);
 
         if (vtcm_size == 0 || layout.total_bytes <= vtcm_size) {
             kparams->kernel_type          = HTP_IM2COL_KERNEL_BLOCKED_DMA;
             kparams->is_2d                = is_2D ? 1 : 0;
             kparams->is_3d                = 0;
-            kparams->n_threads            = (uint8_t) n_threads;
+            kparams->n_threads            = (uint8_t) blk_threads;
             kparams->vtcm_size            = layout.total_bytes;
             kparams->off_src              = layout.off_src;
             kparams->off_dst              = layout.off_dst;
@@ -6495,7 +6494,7 @@ static bool ggml_hexagon_precompute_im2col_3d_params(
             const uint32_t dst_row_bytes = hex_round_up((uint32_t) dst_row_bytes_raw, 256);
 
             struct htp_im2col_vtcm_layout layout;
-            htp_im2col_vtcm_layout_build(&layout, src_row_bytes, dst_row_bytes, n_threads);
+            htp_im2col_vtcm_layout_build(&layout, src_row_bytes, dst_row_bytes, n_threads, 256);
 
             if (vtcm_size == 0 || layout.total_bytes <= vtcm_size) {
                 kparams->kernel_type          = HTP_IM2COL_KERNEL_PATCHEMBED_DMA;
@@ -6548,7 +6547,7 @@ static bool ggml_hexagon_precompute_im2col_3d_params(
         const uint32_t dst_row_bytes = hex_round_up((uint32_t) dst_row_bytes_raw, 256);
 
         struct htp_im2col_vtcm_layout layout;
-        htp_im2col_vtcm_layout_build(&layout, src_row_bytes, dst_row_bytes, n_threads);
+        htp_im2col_vtcm_layout_build(&layout, src_row_bytes, dst_row_bytes, n_threads, 256);
 
         if (vtcm_size == 0 || layout.total_bytes <= vtcm_size) {
             kparams->kernel_type          = HTP_IM2COL_KERNEL_BLOCKED_DMA;

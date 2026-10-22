@@ -26,6 +26,7 @@ struct htp_im2col_context {
     uint32_t pe_row_base;                          // first output row index assigned to this dev (DMA path)
     uint32_t pe_nrows;                             // number of output rows assigned to this dev (DMA path)
     uint32_t pe_rows_per_thread;                   // output rows per worker
+    uint32_t pe_blocks_per_thread;                 // output-col blocks per worker (blocked DMA path)
     uint32_t pe_src_row_bytes;                     // one output row's source, rounded 256
     uint32_t pe_dst_row_bytes;                     // one output row's dst: OW*patch_stride*2, rounded 256
 
@@ -215,6 +216,74 @@ static void FNAME(                                                              
 IM2COL_BLOCKED_COMPUTE_BODY(im2col_blocked_compute_f16, uint16_t, hvx_copy_f16_f32_uu, hvx_splat_u16_u)
 IM2COL_BLOCKED_COMPUTE_BODY(im2col_blocked_compute_f32, float,    hvx_copy_f32_uu,     hvx_splat_f32_u)
 
+// Offsets of one output patch in the staged window, for KH == 1: lane k reads channel k / KW at tap k % KW.
+// Lanes past the patch read the first element and are not stored.
+static void im2col_gather_table_build(const struct htp_im2col_context * ictx, int32_t * restrict table) {
+    const int32_t  d0 = ictx->octx->op_params[4];
+    const uint32_t KW = ictx->KW, Wb = ictx->pe_wb, patch_stride = ictx->patch_stride;
+    const uint32_t n  = hex_round_up(patch_stride, 32);
+    for (uint32_t k = 0; k < n; k++) {
+        table[k] = k < patch_stride ? (int32_t) (((k / KW) * Wb + (k % KW) * d0) * sizeof(float)) : 0;
+    }
+}
+
+// KH == 1: each output row is one patch, gathered from the staged [IC][Wb] window with a fixed offset
+// table shifted by s0 per row, then converted with a single copy.
+// scratch holds the offset table followed by the gathered row (both VTCM).
+#define IM2COL_GATHER_COMPUTE_BODY(FNAME, DST_CTYPE, COPY_FN)                                       \
+static void FNAME(                                                                               \
+    const struct htp_im2col_context * ictx,                                                      \
+    void * restrict dstb_raw, const float * restrict srcb_c,                                     \
+    float * restrict scratch,                                                                    \
+    uint32_t nb, uint32_t c0, uint32_t ioh) {                                                    \
+    (void) ioh;                                                                                  \
+    DST_CTYPE * restrict dstb = (DST_CTYPE *) dstb_raw;                                          \
+    float *     restrict srcb = (float *) srcb_c;                                                \
+    const int32_t  s0 = ictx->octx->op_params[0], p0 = ictx->octx->op_params[2];                 \
+    const uint32_t IC = ictx->IC, IW = ictx->IW, Wb = ictx->pe_wb;                               \
+    const uint32_t patch_stride = ictx->patch_stride;                                            \
+    const uint32_t ng = hex_round_up(patch_stride, 32) / 32;                                     \
+    const int32_t  win0 = (int32_t) c0 * s0 - p0;                                                \
+                                                                                                 \
+    /* the DMA stage fills only the columns inside [0, IW): zero the rest of the window */      \
+    const int32_t lo = win0 < 0 ? -win0 : 0;                                                     \
+    int32_t       hi = (int32_t) IW - win0;                                                      \
+    if (hi > (int32_t) Wb) {                                                                     \
+        hi = (int32_t) Wb;                                                                       \
+    }                                                                                            \
+    if (hi < lo) {                                                                               \
+        hi = lo;                                                                                 \
+    }                                                                                            \
+    if (lo > 0 || hi < (int32_t) Wb) {                                                           \
+        for (uint32_t iic = 0; iic < IC; iic++) {                                                \
+            float * row = srcb + (size_t) iic * Wb;                                              \
+            if (lo > 0) {                                                                        \
+                hvx_splat_f32_u(row, 0, (uint32_t) lo);                                          \
+            }                                                                                    \
+            if (hi < (int32_t) Wb) {                                                             \
+                hvx_splat_f32_u(row + hi, 0, Wb - (uint32_t) hi);                                \
+            }                                                                                    \
+        }                                                                                        \
+    }                                                                                            \
+                                                                                                 \
+    const HVX_Vector * table  = (const HVX_Vector *) scratch;                                    \
+    float *            row    = scratch + (size_t) ng * 32;                                      \
+    const uint32_t     region = IC * Wb * sizeof(float);                                         \
+                                                                                                 \
+    for (uint32_t j = 0; j < nb; j++) {                                                          \
+        const uint32_t shift = j * (uint32_t) s0 * sizeof(float);                                \
+        const size_t   base  = (size_t) ((const uint8_t *) srcb + shift);                        \
+        for (uint32_t g = 0; g < ng; g++) {                                                      \
+            Q6_vgather_ARMVw((HVX_Vector *) (row + g * 32), base, region - shift - 1, table[g]);  \
+        }                                                                                        \
+        hvx_gather_sync(row + (ng - 1) * 32);                                                    \
+        COPY_FN((uint8_t *) (dstb + (size_t) j * patch_stride), (const uint8_t *) row, patch_stride); \
+    }                                                                                            \
+}
+
+IM2COL_GATHER_COMPUTE_BODY(im2col_gather_compute_f16, uint16_t, hvx_copy_f16_f32_uu)
+IM2COL_GATHER_COMPUTE_BODY(im2col_gather_compute_f32, float,    hvx_copy_f32_uu)
+
 static void im2col_blocked_dma_thread(unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     struct htp_im2col_context * ictx      = (struct htp_im2col_context *) data;
@@ -234,24 +303,25 @@ static void im2col_blocked_dma_thread(unsigned int nth, unsigned int ith, void *
     float *        srcb2[2]               = { (float *) srcb_base, (float *) (srcb_base + ictx->pe_src_row_bytes) };
     void *         dstb2[2]               = { dstb_base, dstb_base + ictx->pe_dst_row_bytes };
     float *        scratch                = (float *) (srcb_base + 2 * ictx->pe_src_row_bytes);
-    const uint32_t row_end_max            = ictx->pe_row_base + ictx->pe_nrows;
-    const uint32_t row_start              = ictx->pe_row_base + ictx->pe_rows_per_thread * ith;
-    const uint32_t row_end                = MIN(row_start + ictx->pe_rows_per_thread, row_end_max);
-    if (row_start >= row_end) {
+    // work is split over output-col blocks, so a single output row (1D) still uses every thread
+    const uint32_t blk_end_max  = ictx->pe_nrows * nbpr;
+    const uint32_t blk_start    = ictx->pe_blocks_per_thread * ith;
+    const uint32_t blk_end      = MIN(blk_start + ictx->pe_blocks_per_thread, blk_end_max);
+    if (blk_start >= blk_end) {
         return;
     }
-    const uint32_t nrows_local  = row_end - row_start;
-    const uint32_t total_blocks = nrows_local * nbpr;
-    if (total_blocks == 0) {
-        return;
-    }
+    const uint32_t total_blocks = blk_end - blk_start;
+    const uint32_t row_start    = ictx->pe_row_base + blk_start / nbpr;
     struct im2col_cursor cur = {
         .r   = row_start,
-        .in  = ictx->thread_in[ith],
+        .in  = row_start / ictx->OH,
         .iod = 0,
-        .ioh = ictx->thread_ioh[ith],
-        .c0  = 0,
+        .ioh = row_start % ictx->OH,
+        .c0  = (blk_start % nbpr) * owb,
     };
+    if (KH == 1) {
+        im2col_gather_table_build(ictx, (int32_t *) scratch);
+    }
     struct im2col_cursor stage = cur;
     for (uint32_t i = 0; i < total_blocks && i < 2; i++) {
         dma_queue_push(dma_q, dma_make_data(dst_data, dstb2[i]), 0, 0, 0, 0);
@@ -834,9 +904,17 @@ int op_im2col(struct htp_ops_context * octx) {
         work_queue_run(octx->ctx->work_queue, im2col_patchembed_dma_thread, &ictx, pth);
         return HTP_STATUS_OK;
     } else if (kparams->kernel_type == HTP_IM2COL_KERNEL_BLOCKED_DMA) {
-        ictx.compute = dst->type == HTP_TYPE_F16 ? (void *) im2col_blocked_compute_f16
-                                                 : (void *) im2col_blocked_compute_f32;
-        work_queue_run(octx->ctx->work_queue, im2col_blocked_dma_thread, &ictx, pth);
+        const uint32_t nblocks = nrows * kparams->nbpr;
+        const uint32_t bth     = MIN(octx->n_threads, nblocks);
+        ictx.pe_blocks_per_thread = (nblocks + bth - 1) / bth;
+        if (kparams->KH == 1) {
+            ictx.compute = dst->type == HTP_TYPE_F16 ? (void *) im2col_gather_compute_f16
+                                                     : (void *) im2col_gather_compute_f32;
+        } else {
+            ictx.compute = dst->type == HTP_TYPE_F16 ? (void *) im2col_blocked_compute_f16
+                                                     : (void *) im2col_blocked_compute_f32;
+        }
+        work_queue_run(octx->ctx->work_queue, im2col_blocked_dma_thread, &ictx, bth);
         return HTP_STATUS_OK;
     }
 

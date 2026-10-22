@@ -18,18 +18,25 @@ struct htp_im2col_vtcm_layout {
     uint32_t total_bytes;
 };
 
+// scratch_bytes: per-thread VTCM after the two src buffers (at least 256)
 static inline void htp_im2col_vtcm_layout_build(
     struct htp_im2col_vtcm_layout * layout,
     uint32_t src_row_bytes,
     uint32_t dst_row_bytes,
-    uint32_t n_threads) {
+    uint32_t n_threads,
+    uint32_t scratch_bytes) {
 
-    layout->src_bytes_per_thread = 2 * src_row_bytes + 256;
+    layout->src_bytes_per_thread = 2 * src_row_bytes + (scratch_bytes > 256 ? scratch_bytes : 256);
     layout->dst_bytes_per_thread = 2 * dst_row_bytes;
 
     layout->off_src     = 0;
     layout->off_dst     = layout->off_src + layout->src_bytes_per_thread * n_threads;
     layout->total_bytes = layout->off_dst + layout->dst_bytes_per_thread * n_threads;
+}
+
+// scratch of the KH == 1 gather path: the offset table and one gathered row, both padded to whole vectors
+static inline uint32_t htp_im2col_gather_scratch_bytes(uint32_t patch_stride) {
+    return 2 * hex_round_up(patch_stride, 32) * (uint32_t) sizeof(float);
 }
 
 struct htp_im2col_kernel_params {
