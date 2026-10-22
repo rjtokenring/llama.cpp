@@ -3662,6 +3662,123 @@ struct test_scale : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT / GGML_OP_GET_ROWS on a 2D slice of a 3D weight, e.g. one table of a stack of codebooks
+struct test_weight_slice : public test_case {
+    const bool get_rows;
+    const ggml_type type;
+    const std::array<int64_t, 3> ne; // weight: {k, m, n_slices}
+    const int64_t slice;
+
+    bool use_weight_context() override { return true; }
+
+    double max_nmse_err() override {
+        return get_rows ? 1e-7 : 5e-4;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(get_rows, type, ne, slice);
+    }
+
+    test_weight_slice(bool get_rows = false,
+            ggml_type type = GGML_TYPE_Q8_0,
+            std::array<int64_t, 3> ne = {256, 64, 3},
+            int64_t slice = 1)
+        : get_rows(get_rows), type(type), ne(ne), slice(slice) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * w = ggml_new_tensor_3d(ctx_weights, type, ne[0], ne[1], ne[2]);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * ws = ggml_view_2d(ctx, w, ne[0], ne[1], w->nb[1], slice * w->nb[2]);
+        ggml_set_name(ws, "w_slice");
+
+        ggml_tensor * out;
+        if (get_rows) {
+            ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+            ggml_set_name(rows, "rows");
+            out = ggml_get_rows(ctx, ws, rows);
+        } else {
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], 1);
+            ggml_set_name(x, "x");
+            out = ggml_mul_mat(ctx, ws, x);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = rand() % ne[1];
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_SCALE + GGML_OP_CPY (f32 -> i32)
+// integer-valued results must survive the truncating cast, e.g. index constants built as scale_bias(x, 0, n)
+struct test_scale_cast : public test_case {
+    const std::array<int64_t, 4> ne;
+    float scale;
+    float bias;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SCALE_CAST";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, scale, bias);
+    }
+
+    test_scale_cast(std::array<int64_t, 4> ne = {64, 1, 1, 1},
+            float scale = 0.0f,
+            float bias = 16.0f)
+        : ne(ne), scale(scale), bias(bias) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_cast(ctx, ggml_scale_bias(ctx, a, scale, bias), GGML_TYPE_I32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (scale == 0.0f) {
+                // any finite input gives the integer bias
+                init_tensor_uniform(t);
+                continue;
+            }
+            // integer-valued inputs keep scale * a + bias an exact integer
+            std::vector<float> data(ggml_nelements(t));
+            for (size_t i = 0; i < data.size(); i++) {
+                data[i] = (float) (i % 1024);
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+        }
+    }
+};
+
 // GGML_OP_SCALE + GGML_UNARY_OP_TANH + GGML_OP_SCALE
 struct test_softcap : public test_case {
     const ggml_type type;
@@ -10796,6 +10913,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {10, 10, 10, 10}, 2.0f, 1.0f));
     test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {10, 10, 10, 10}, 2.0f, 1.0f, true)); // inplace test
     test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {100, 10, 10, 10}, 0.5f, 0.0f));
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_F16 }) {
+        for (bool get_rows : { false, true }) {
+            test_cases.emplace_back(new test_weight_slice(get_rows, type, {256, 64, 3}, 0));
+            test_cases.emplace_back(new test_weight_slice(get_rows, type, {256, 64, 3}, 2));
+        }
+    }
+    test_cases.emplace_back(new test_scale_cast({1, 1, 1, 1}, 0.0f, 16.0f));
+    test_cases.emplace_back(new test_scale_cast({64, 1, 1, 1}, 0.0f, 16.0f));
+    test_cases.emplace_back(new test_scale_cast({1024, 1, 1, 1}, 1.0f, -16.0f));
+    test_cases.emplace_back(new test_scale_cast({1024, 1, 1, 1}, -1.0f, 16.0f));
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
     test_cases.emplace_back(new test_silu_back());
 

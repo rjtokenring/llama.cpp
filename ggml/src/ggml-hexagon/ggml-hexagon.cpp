@@ -491,6 +491,30 @@ static inline bool ggml_hexagon_tensor_is_fuseable(const struct ggml_tensor * t)
     return (extra->flags & GGML_HEXAGON_TENSOR_FUSEABLE) != 0;
 }
 
+// Flags of a tensor as the kernels see it. A view that covers whole matrices of a tiled weight
+// (same ne0/ne1, starting on a matrix boundary) is a tiled weight too: each [ne0, ne1] matrix is
+// tiled in place, so when a tiled matrix takes as many bytes as a plain one the view points at
+// its tiles.
+static inline uint32_t ggml_hexagon_tensor_flags(const struct ggml_tensor * t) {
+    const auto * extra = (const ggml_hexagon_tensor_extra *) t->extra;
+    uint32_t flags = extra ? extra->flags : 0;
+
+    const struct ggml_tensor * src = t->view_src;
+    const auto * src_extra = src ? (const ggml_hexagon_tensor_extra *) src->extra : nullptr;
+    if (!src_extra || (src_extra->flags & GGML_HEXAGON_TENSOR_TILED) == 0) {
+        return flags;
+    }
+
+    const size_t matrix_size = htp_tiled_row_size(src->type, hex_round_up(src->ne[0], 32)) * hex_round_up(src->ne[1], 32);
+    const bool whole_matrices = t->type == src->type && t->ne[0] == src->ne[0] && t->ne[1] == src->ne[1] && t->ne[3] == 1 &&
+                                t->nb[1] == src->nb[1] && (t->ne[2] == 1 || t->nb[2] == src->nb[2]) &&
+                                matrix_size == src->nb[2] && t->view_offs % src->nb[2] == 0;
+    if (whole_matrices) {
+        flags |= src_extra->flags & (GGML_HEXAGON_TENSOR_TILED | GGML_HEXAGON_TENSOR_WEIGHT);
+    }
+    return flags;
+}
+
 static inline bool ggml_hexagon_can_rt_repack(const struct ggml_tensor * t) {
     if (opt_rt_repack == 0 || !htp_is_tiled_weight_tensor(t)) {
         return false;
@@ -502,16 +526,14 @@ static inline bool ggml_hexagon_can_rt_repack(const struct ggml_tensor * t) {
 }
 
 static inline bool ggml_hexagon_tensor_is_tiled(const struct ggml_tensor * t) {
-    const auto * extra = (const ggml_hexagon_tensor_extra *) t->extra;
-    if (extra && (extra->flags & GGML_HEXAGON_TENSOR_TILED)) {
+    if (ggml_hexagon_tensor_flags(t) & GGML_HEXAGON_TENSOR_TILED) {
         return true;
     }
     return ggml_hexagon_can_rt_repack(t);
 }
 
 static inline bool ggml_hexagon_needs_repack(const struct ggml_tensor * t) {
-    const auto * extra = (const ggml_hexagon_tensor_extra *) t->extra;
-    if (extra && (extra->flags & GGML_HEXAGON_TENSOR_TILED)) {
+    if (ggml_hexagon_tensor_flags(t) & GGML_HEXAGON_TENSOR_TILED) {
         return false;
     }
     return ggml_hexagon_can_rt_repack(t);
@@ -951,7 +973,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
     HEX_VERBOSE("ggml-hex: %s get-tensor %s : data %p offset %zu size %zu usage %d flags 0x%x\n",
             sess->c_name(), tensor->name, data, offset, size, (int) buffer->usage, extra->flags);
 
-    if ((extra->flags & GGML_HEXAGON_TENSOR_TILED) == 0) {
+    if ((ggml_hexagon_tensor_flags(tensor) & GGML_HEXAGON_TENSOR_TILED) == 0) {
         memcpy(data, (const char *) tensor->data + offset, size);
         return;
     }
@@ -1030,7 +1052,7 @@ static void ggml_backend_hexagon_buffer_get_tensor_2d(ggml_backend_buffer_t buff
     HEX_VERBOSE("ggml-hex: %s get-tensor-2d %s : data %p offset %zu size %zu n_copies %zu stride_tensor %zu stride_data %zu usage %d\n",
                 sess->c_name(), tensor->name, data, offset, size, n_copies, stride_tensor, stride_data, (int) buffer->usage);
 
-    if ((extra->flags & GGML_HEXAGON_TENSOR_TILED) == 0) {
+    if ((ggml_hexagon_tensor_flags(tensor) & GGML_HEXAGON_TENSOR_TILED) == 0) {
         for (size_t i = 0; i < n_copies; i++) {
             memcpy((uint8_t *)data + i * stride_data, (const uint8_t *)tensor->data + offset + i * stride_tensor, size);
         }
@@ -1516,9 +1538,7 @@ struct ggml_hexagon_opbatch {
     }
 
     bool same_shape(const htp_tensor * h, const ggml_tensor * t) const {
-        auto extra = (ggml_hexagon_tensor_extra *) t->extra;
-
-        const bool is_tiled = (extra->flags & GGML_HEXAGON_TENSOR_TILED) != 0;
+        const bool is_tiled = (ggml_hexagon_tensor_flags(t) & GGML_HEXAGON_TENSOR_TILED) != 0;
         const int64_t ne0_padded = hex_round_up(t->ne[0], 32);
         const int64_t ne1_padded = hex_round_up(t->ne[1], 32);
 
@@ -1535,7 +1555,7 @@ struct ggml_hexagon_opbatch {
 
     // add tensor and return its index
     int add_tensor(const ggml_tensor * t) {
-        auto extra = (ggml_hexagon_tensor_extra *) t->extra;
+        const uint32_t flags = ggml_hexagon_tensor_flags(t);
         auto sbuf  = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
 
         // First lookup by tensor data
@@ -1569,7 +1589,7 @@ struct ggml_hexagon_opbatch {
         h.ne[2] = t->ne[2];
         h.ne[3] = t->ne[3];
 
-        const bool is_tiled = (extra->flags & GGML_HEXAGON_TENSOR_TILED) != 0;
+        const bool is_tiled = (flags & GGML_HEXAGON_TENSOR_TILED) != 0;
         if (is_tiled) {
             if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_BF16) {
                 h.type  = GGML_TYPE_F16;
@@ -1590,13 +1610,13 @@ struct ggml_hexagon_opbatch {
         }
 
         h.flags = 0;
-        if ((extra->flags & GGML_HEXAGON_TENSOR_WEIGHT) != 0) {
+        if ((flags & GGML_HEXAGON_TENSOR_WEIGHT) != 0) {
             h.flags |= HTP_TENSOR_WEIGHT;
         }
-        if ((extra->flags & GGML_HEXAGON_TENSOR_TILED) != 0) {
+        if ((flags & GGML_HEXAGON_TENSOR_TILED) != 0) {
             h.flags |= HTP_TENSOR_TILED;
         }
-        if ((extra->flags & GGML_HEXAGON_TENSOR_FENCE) != 0) {
+        if ((flags & GGML_HEXAGON_TENSOR_FENCE) != 0) {
             h.flags |= HTP_TENSOR_FENCE;
         }
 
@@ -5411,7 +5431,10 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q2_K: {
-            if (!ggml_is_contiguous(src0) || ggml_is_permuted(src0) || ggml_is_view(src0)) {
+            if (!ggml_is_contiguous(src0) || ggml_is_permuted(src0)) {
+                return false;
+            }
+            if (ggml_is_view(src0) && (ggml_hexagon_tensor_flags(src0) & GGML_HEXAGON_TENSOR_TILED) == 0) {
                 return false;
             }
 
