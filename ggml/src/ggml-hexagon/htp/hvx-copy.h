@@ -261,6 +261,28 @@ static inline void hvx_copy_f32_f16_uu(uint8_t * restrict dst, const uint8_t * r
 
 //// fp32 -> int32
 
+// Truncating f32 -> i32 like the CPU cast, except that a value within 4 ulps of the next integer
+// away from zero becomes that integer. HVX float math can land an ulp or two short of an exact
+// integer result (e.g. qf32 adds below v79: 2048 - 37 -> 2010.9998), which truncation would turn
+// into the integer below. The distance is measured on the f32 bits, so the check itself is exact.
+static inline HVX_Vector hvx_vec_f32_to_i32(HVX_Vector x) {
+    const HVX_Vector zero = Q6_V_vzero();
+    const HVX_Vector one  = Q6_V_vsplat_R(1);
+
+    HVX_Vector ax  = Q6_V_vand_VV(x, Q6_V_vsplat_R(0x7fffffff)); // |x|
+    HVX_Vector at  = Q6_Vw_equals_Vsf(ax);                         // trunc(|x|)
+    HVX_Vector at1 = Q6_Vw_vadd_VwVw(at, one);
+
+    // |x| is not an integer (all f32 at or above 2^23 are) and lies within 4 ulps of trunc(|x|) + 1
+    HVX_VectorPred frac = Q6_Q_and_QQ(Q6_Q_vcmp_gt_VwVw(ax, Q6_Vsf_equals_Vw(at)),
+                                      Q6_Q_vcmp_gt_VwVw(Q6_V_vsplat_R(0x4b000000), ax));
+    HVX_Vector ulps = Q6_Vw_vsub_VwVw(Q6_Vsf_equals_Vw(at1), ax);
+    HVX_VectorPred snap = Q6_Q_and_QQ(frac, Q6_Q_vcmp_gt_VwVw(Q6_V_vsplat_R(5), ulps));
+
+    HVX_Vector am = Q6_V_vmux_QVV(snap, at1, at);
+    return Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VwVw(zero, x), Q6_Vw_vsub_VwVw(zero, am), am);
+}
+
 #define hvx_copy_i32_f32_loop_body(dst_type, src_type, vec_store) \
     do {                                                          \
         dst_type * restrict vdst = (dst_type *) dst;              \
@@ -274,10 +296,10 @@ static inline void hvx_copy_f32_f16_uu(uint8_t * restrict dst, const uint8_t * r
         uint32_t i = 0;                                           \
         _Pragma("unroll(4)")                                      \
         for (; i < nvec; i++) {                                   \
-            vdst[i] = Q6_Vw_equals_Vsf(vsrc[i]);                  \
+            vdst[i] = hvx_vec_f32_to_i32(vsrc[i]);                \
         }                                                         \
         if (nloe) {                                               \
-            HVX_Vector v = Q6_Vw_equals_Vsf(vsrc[i]);             \
+            HVX_Vector v = hvx_vec_f32_to_i32(vsrc[i]);           \
             vec_store((void *) &vdst[i], nloe * elem_size, v);    \
         }                                                         \
     } while(0)
