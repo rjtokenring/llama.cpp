@@ -10921,6 +10921,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_scale_cast({1, 1, 1, 1}, 0.0f, 16.0f));
     test_cases.emplace_back(new test_scale_cast({64, 1, 1, 1}, 0.0f, 16.0f));
+    test_cases.emplace_back(new test_scale_cast({64, 1, 1, 1}, -1.0f, 2048.0f));
+    test_cases.emplace_back(new test_scale_cast({64, 1, 1, 1},  1.0f, -2048.0f));
     test_cases.emplace_back(new test_scale_cast({1024, 1, 1, 1}, 1.0f, -16.0f));
     test_cases.emplace_back(new test_scale_cast({1024, 1, 1, 1}, -1.0f, 16.0f));
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
@@ -12034,6 +12036,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_roll(3, -2, 1, -1, true));
     test_cases.emplace_back(new test_arange());
     test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, 1048576.0f, 1.0f));
+    test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 2.0f, 16.0f, 1.0f));
+    test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 15.0f, 16.0f, 1.0f));
+    test_cases.emplace_back(new test_arange(GGML_TYPE_F32, -3.5f, 70.0f, 0.25f));
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_leaky_relu());
 

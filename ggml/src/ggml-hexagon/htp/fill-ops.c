@@ -144,3 +144,101 @@ int op_fill(struct htp_ops_context * octx) {
 
     return HTP_STATUS_OK;
 }
+
+// ggml op_params layout for ARANGE:
+//   op_params[0], op_params[2] (as float) - start and step: dst[i] = start + step * i
+
+struct htp_arange_context {
+    struct htp_ops_context * octx;
+    uint32_t n;              // number of elements
+    uint32_t n_per_thread;   // multiple of 32
+    float    start;
+    float    step;
+    bool     exact;          // integer start and step: computed in i32 and converted exactly
+};
+
+static void arange_thread(unsigned int nth, unsigned int ith, void * data) {
+    const struct htp_arange_context * actx = (const struct htp_arange_context *) data;
+    struct htp_ops_context          * octx = actx->octx;
+
+    const uint32_t i0 = actx->n_per_thread * ith;
+    const uint32_t i1 = MIN(i0 + actx->n_per_thread, actx->n);
+    if (i0 >= i1) {
+        return;
+    }
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i0);
+
+    static const int32_t lane_idx[32] __attribute__((aligned(128))) = {
+         0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
+    };
+
+    float * dst = (float *) octx->dst->data;
+
+    const HVX_Vector v_32   = Q6_V_vsplat_R(32);
+    HVX_Vector       v_idx  = Q6_Vw_vadd_VwVw(*(const HVX_Vector *) lane_idx, Q6_V_vsplat_R((int32_t) i0));
+
+    if (actx->exact) {
+        // start + step * i stays below 2^24 here, so the i32 values convert exactly
+        const int32_t start = (int32_t) actx->start;
+        const int32_t step  = (int32_t) actx->step;
+        int32_t first[32] __attribute__((aligned(128)));
+        for (int l = 0; l < 32; l++) {
+            first[l] = start + step * (int32_t) (i0 + l);
+        }
+        HVX_Vector       v_val  = *(const HVX_Vector *) first;
+        const HVX_Vector v_incr = Q6_V_vsplat_R(32 * step);
+        for (uint32_t i = i0; i < i1; i += 32) {
+            hvx_vec_store_u(dst + i, MIN(32, i1 - i) * sizeof(float), Q6_Vsf_equals_Vw(v_val));
+            v_val = Q6_Vw_vadd_VwVw(v_val, v_incr);
+        }
+    } else {
+        const HVX_Vector v_start = hvx_vec_splat_f32(actx->start);
+        const HVX_Vector v_step  = hvx_vec_splat_f32(actx->step);
+        for (uint32_t i = i0; i < i1; i += 32) {
+            HVX_Vector v = hvx_vec_add_f32_f32(v_start, hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(v_idx), v_step));
+            hvx_vec_store_u(dst + i, MIN(32, i1 - i) * sizeof(float), v);
+            v_idx = Q6_Vw_vadd_VwVw(v_idx, v_32);
+        }
+    }
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i1);
+}
+
+int op_arange(struct htp_ops_context * octx) {
+    const struct htp_tensor * dst = octx->dst;
+
+    if (dst->type != HTP_TYPE_F32 || htp_tensor_is_extended(dst)) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    // a single row: with several sessions the first one writes it, like FILL does
+    if (octx->ctx->mdev.count > 1 && octx->ctx->mdev.idx != 0) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t n = dst->ne[0];
+    if (n == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    struct htp_arange_context actx = {
+        .octx = octx,
+        .n    = n,
+    };
+    memcpy(&actx.start, &octx->op_params[0], sizeof(float));
+    memcpy(&actx.step,  &octx->op_params[2], sizeof(float));
+
+    const float last = actx.start + actx.step * (float) (n - 1);
+    actx.exact = actx.start == (float) (int32_t) actx.start && actx.step == (float) (int32_t) actx.step &&
+                 fabsf(actx.start) < 16777216.0f && fabsf(last) < 16777216.0f && fabsf(actx.step) * 32.0f < 16777216.0f;
+
+    const uint32_t n_threads = MIN(octx->n_threads, (n + 31) / 32);
+    actx.n_per_thread = (((n + n_threads - 1) / n_threads) + 31) & ~31u;
+
+    work_queue_run(octx->ctx->work_queue, arange_thread, &actx, n_threads);
+
+    return HTP_STATUS_OK;
+}

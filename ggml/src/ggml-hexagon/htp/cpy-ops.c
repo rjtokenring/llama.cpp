@@ -269,7 +269,7 @@ static int cpy_scalar(struct htp_ops_context * octx, const struct htp_copy_kerne
     HVX_Vector v_dst;
 
     if (src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_I32) {
-        v_dst = Q6_Vw_equals_Vsf(v_src);
+        v_dst = hvx_vec_f32_to_i32(v_src);
     } else if (src0->type == HTP_TYPE_I32 && dst->type == HTP_TYPE_F32) {
         v_dst = Q6_Vsf_equals_Vw(v_src);
     } else if (src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_F16) {

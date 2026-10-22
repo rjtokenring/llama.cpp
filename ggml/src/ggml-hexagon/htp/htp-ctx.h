@@ -162,6 +162,7 @@ int op_top_k(struct htp_ops_context * octx);
 int op_ssm_conv(struct htp_ops_context * octx);
 int op_cumsum(struct htp_ops_context * octx);
 int op_fill(struct htp_ops_context * octx);
+int op_arange(struct htp_ops_context * octx);
 int op_concat(struct htp_ops_context * octx);
 int op_diag(struct htp_ops_context * octx);
 int op_solve_tri(struct htp_ops_context * octx);

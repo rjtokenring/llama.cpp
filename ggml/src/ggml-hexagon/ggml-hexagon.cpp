@@ -6757,6 +6757,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_REPEAT:          return HTP_OP_REPEAT;
         case GGML_OP_CUMSUM:          return HTP_OP_CUMSUM;
         case GGML_OP_FILL:            return HTP_OP_FILL;
+        case GGML_OP_ARANGE:          return HTP_OP_ARANGE;
         case GGML_OP_DIAG:            return HTP_OP_DIAG;
         case GGML_OP_SOLVE_TRI:       return HTP_OP_SOLVE_TRI;
         case GGML_OP_TRI:             return HTP_OP_TRI;
@@ -7758,6 +7759,11 @@ static bool ggml_hexagon_supported_fill(const struct ggml_hexagon_session * sess
     GGML_UNUSED(sess);
 }
 
+static bool ggml_hexagon_supported_arange(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
+    GGML_UNUSED(sess);
+}
+
 static bool ggml_hexagon_supported_roll(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
     GGML_UNUSED(sess);
 
@@ -7966,6 +7972,10 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_FILL:
             supp = ggml_hexagon_supported_fill(sess, op);
+            break;
+
+        case GGML_OP_ARANGE:
+            supp = ggml_hexagon_supported_arange(sess, op);
             break;
 
         case GGML_OP_DIAG:
