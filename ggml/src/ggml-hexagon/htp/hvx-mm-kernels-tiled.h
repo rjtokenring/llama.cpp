@@ -268,7 +268,7 @@ static void quantize_row_f32_q8_0_tiled(float * restrict x, uint8_t * restrict y
 
 static void quantize_row_f32_q8_0_s32_tiled(float * restrict x, uint8_t * restrict y, uint32_t k) {
     assert(k % 32 == 0);
-    const uint32_t qk = QK_Q8_0_TILED;
+    const uint32_t qk = HTP_MM_ACT_BLOCK_K;
     const uint32_t nb = (k + qk - 1) / qk;
 
     for (uint32_t i = 0; i < nb; i++) {
@@ -2132,7 +2132,7 @@ static inline void quantize_f32_q8_0_s32_tiled_block_kernel(
     uint32_t c
 ) {
     (void) tmp_data;
-    const uint32_t qk = QK_Q8_0_TILED;
+    const uint32_t qk = HTP_MM_ACT_BLOCK_K;
     const uint32_t nb = (ne0 + qk - 1) / qk;
 
     for (uint32_t ib = ib_first; ib < ib_last; ++ib) {
