@@ -1177,6 +1177,19 @@ clip_image_size mtmd_image_preprocessor_lfm2::get_grid_layout(const clip_hparams
 // mtmd_image_preprocessor_idefics3
 //
 
+// an image that fits in one tile is not split, as in transformers: the overview alone is encoded
+static mtmd_image_preproc_out idefics3_output(const clip_hparams & hparams, const clip_image_u8 & overview,
+        const std::vector<clip_image_u8> & slices, int grid_x, int grid_y) {
+    mtmd_image_preproc_out output;
+    output.append_overview(hparams, overview, true);
+    if (grid_x * grid_y > 1) {
+        output.append(hparams, slices, true);
+        output.grid_x = grid_x;
+        output.grid_y = grid_y;
+    }
+    return output;
+}
+
 mtmd_image_preproc_out mtmd_image_preprocessor_idefics3::preprocess(const clip_image_u8 & img) const {
     // The refined size has two steps:
     // 1. Resize w/ aspect-ratio preserving such that the longer side is
@@ -1228,12 +1241,7 @@ mtmd_image_preproc_out mtmd_image_preprocessor_idefics3::preprocess(const clip_i
 
         LOG_DBG("%s: grid size: %d x %d (%d tiles) + overview\n", __func__, grid_x, grid_y, grid_x * grid_y);
 
-        mtmd_image_preproc_out output;
-        output.append_overview(hparams, overview, true);
-        output.append(hparams, slices, true);
-        output.grid_x = grid_x;
-        output.grid_y = grid_y;
-        return output;
+        return idefics3_output(hparams, overview, slices, grid_x, grid_y);
     }
 
     const clip_image_size refined_size = img_tool::calc_size_preserved_ratio(
@@ -1265,12 +1273,7 @@ mtmd_image_preproc_out mtmd_image_preprocessor_idefics3::preprocess(const clip_i
     }
     auto sliced = slice_image(img, instructions);
 
-    mtmd_image_preproc_out output;
-    output.append_overview(hparams, sliced.overview, true);
-    output.append(hparams, sliced.slices, true);
-    output.grid_x = instructions.grid_size.width;
-    output.grid_y = instructions.grid_size.height;
-    return output;
+    return idefics3_output(hparams, sliced.overview, sliced.slices, instructions.grid_size.width, instructions.grid_size.height);
 }
 
 //

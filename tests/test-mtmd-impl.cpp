@@ -234,6 +234,45 @@ MAKE_TEST(test_image_preprocessor_lfm2_torch_resize) {
     }
 }
 
+MAKE_TEST(test_image_preprocessor_idefics3) {
+    // SmolVLM2-500M: 512 px tiles of 64 tokens
+    clip_hparams hparams;
+    hparams.image_size = 512;
+    hparams.patch_size = 16;
+    hparams.n_merge = 4;
+    for (int i = 0; i < 3; i++) {
+        hparams.image_mean[i] = 0.5f;
+        hparams.image_std[i]  = 0.5f;
+    }
+
+    auto layout = [&hparams](const clip_image_size & size) {
+        const mtmd_image_preprocessor_idefics3 preproc(hparams);
+        const auto out = preproc.preprocess(make_test_image(size));
+        return std::to_string(out.entries.size()) + " slices, grid " + std::to_string(out.grid_x) + "x" + std::to_string(out.grid_y) +
+            (out.has_overview() ? " + overview" : "");
+    };
+
+    // { image size, expected layout, as Idefics3ImageProcessor.split_image: no slices when the image fits in one tile }
+    const std::vector<std::pair<clip_image_size, std::string>> cases = {
+        { {  640,  480 }, "0 slices, grid 0x0 + overview" },
+        { { 1024,  683 }, "2 slices, grid 2x1 + overview" },
+    };
+
+    // gguf without preprocessor longest size
+    for (const auto & [size, expected] : cases) {
+        t.assert_equal("layout for " + image_size_to_str(size), expected, layout(size));
+    }
+
+    // longest size 2048
+    hparams.image_longest_edge = 2048;
+    t.assert_equal("layout for 640x480 with longest edge 2048", std::string("12 slices, grid 4x3 + overview"), layout({ 640, 480 }));
+
+    // --image-max-tokens 64 clamps the refined size to one tile
+    hparams.custom_image_max_tokens = 64;
+    hparams.set_limit_image_tokens();
+    t.assert_equal("layout for 1389x1500 with max 64 tokens", std::string("0 slices, grid 0x0 + overview"), layout({ 1389, 1500 }));
+}
+
 //
 // mtmd temporal merge
 //
