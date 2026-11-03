@@ -12136,6 +12136,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {4, 1, 3, 2}, {1, 1, 3, 2}, (ggml_scale_mode)(mode | GGML_SCALE_FLAG_ALIGN_CORNERS)));
         test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {64, 48, 48, 1}, {156, 104, 64, 1}, (ggml_scale_mode)(mode | GGML_SCALE_FLAG_ALIGN_CORNERS), {2, 0, 1, 3}));
     }
+    // antialias resize of a permuted [n_embd, n, n] table to the patch grid (SigLIP2 position embeddings):
+    // upscaling on both axes (2x, non-integer, 2x with 32-aligned rows) and upscaling on one axis only
+    {
+        const ggml_scale_mode mode = ggml_scale_mode(GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS);
+        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {768, 16, 16, 1}, {32, 32, 768, 1}, mode, {2, 0, 1, 3}));
+        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {768, 16, 16, 1}, {30, 34, 768, 1}, mode, {2, 0, 1, 3}));
+        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {64,  32, 32, 1}, {64, 64,  64, 1}, mode, {2, 0, 1, 3}));
+        test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {64,  16, 16, 1}, {24, 12,  64, 1}, mode, {2, 0, 1, 3}));
+    }
 
     test_cases.emplace_back(new test_sum());
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, {11, 5, 6, 3}, {0, 2, 1, 3}));  // row-contiguous but non-contiguous
@@ -12779,6 +12788,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SWIGLU, type, { 17408, n_tokens, 1, 1 }, 0));
         }
     }
+
+    // SigLIP2 position embeddings resized for a 512x512 tile: 16x16 table -> 32x32 patch grid, antialias
+    test_cases.emplace_back(new test_interpolate(GGML_TYPE_F32, {768, 16, 16, 1}, {32, 32, 768, 1},
+        ggml_scale_mode(GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS), {2, 0, 1, 3}));
 
     // CONT of a 0<->2 permute at DeepSeek-V4 lightning-indexer shapes:
     // indexer_kq is [n_kv, n_tokens, n_head=64] and gets ggml_cont(ggml_permute(.., 2,1,0,3)).

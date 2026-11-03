@@ -2423,7 +2423,9 @@ bool htp_kparams_solve_upscale(
     }
 
     const bool align_corners = (mode_flags & GGML_SCALE_FLAG_ALIGN_CORNERS) != 0;
-    const bool antialias     = (mode_flags & GGML_SCALE_FLAG_ANTIALIAS) != 0;
+    // upscaling: the antialias triangle filter has radius 1 and gives the same result as plain bilinear
+    const bool antialias     = (mode_flags & GGML_SCALE_FLAG_ANTIALIAS) != 0 &&
+                               (align_corners || dst_x < src_x || dst_y < src_y);
 
     float sf0 = (float) dst_x / (float) src_x;
     float sf1 = (float) dst_y / (float) src_y;
