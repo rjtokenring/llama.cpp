@@ -9818,7 +9818,6 @@ static void ggml_compute_forward_ssm_conv_f32(
     const int nth = params->nth;
 
     const int nc  = src1->ne[0]; // d_conv
-    const int ncs = src0->ne[0]; // d_conv - 1 + n_t
     const int nr  = src0->ne[1]; // d_inner
     const int n_t =  dst->ne[1]; // tokens per sequence
     const int n_s =  dst->ne[2]; // number of sequences in the batch
@@ -9834,28 +9833,56 @@ static void ggml_compute_forward_ssm_conv_f32(
     // row range for this thread
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
-    const int ir  = ir1 - ir0;
+
+    const size_t nbt = dst->nb[1] / sizeof(float); // output stride between tokens
+
+    // a few rows at a time: their part of conv_x stays in the cache while the window slides along the tokens
+    const int nrb = 16;
 
     for (int i3 = 0; i3 < n_s; ++i3) {
-        for (int i2 = 0; i2 < n_t; ++i2) {
-            // {d_conv - 1 + n_t, d_inner, n_seqs}
-            // sliding window
-            const float * s = (const float *) ((const char *) src0->data + ir0*(src0->nb[1]) + i2*(src0->nb[0]) + i3*(src0->nb[2])); // {d_conv, d_inner, n_s}
-            const float * c = (const float *) ((const char *) src1->data + ir0*(src1->nb[1])); // {d_conv, d_inner}
-            float * x = (float *) ((char *) dst->data + ir0*(dst->nb[0]) + i2*(dst->nb[1]) + i3*(dst->nb[2])); // {d_inner, n_t, n_s}
+        float * x = (float *) ((char *) dst->data + i3*(dst->nb[2])); // {d_inner, n_t}
 
-            // TODO: transpose the output for smaller strides for big batches?
-            // d_inner
-            for (int i1 = 0; i1 < ir; ++i1) {
-                // rowwise dot product
-                // NOTE: not using ggml_vec_dot_f32, because its sum is in double precision
-                float sumf = 0.0f;
+        for (int ib = ir0; ib < ir1; ib += nrb) {
+            const int ie = MIN(ib + nrb, ir1);
 
-                // d_conv
-                for (int i0 = 0; i0 < nc; ++i0) {
-                    sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
+            int i2 = 0;
+#if defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE) && !defined(__riscv_v)
+            // GGML_F32_EPR tokens of a row per step
+            for (; i2 + GGML_F32_EPR <= n_t; i2 += GGML_F32_EPR) {
+                float tmp[GGML_F32_EPR][nrb];
+                for (int i1 = ib; i1 < ie; ++i1) {
+                    const float * s = (const float *) ((const char *) src0->data + i1*(src0->nb[1]) + i3*(src0->nb[2])) + i2;
+                    const float * c = (const float *) ((const char *) src1->data + i1*(src1->nb[1]));
+
+                    GGML_F32_VEC sum = GGML_F32_VEC_ZERO;
+                    for (int i0 = 0; i0 < nc; ++i0) {
+                        sum = GGML_F32_VEC_ADD(sum, GGML_F32_VEC_MUL(GGML_F32_VEC_LOAD(s + i0), GGML_F32_VEC_SET1(c[i0])));
+                    }
+                    float t[GGML_F32_EPR];
+                    GGML_F32_VEC_STORE(t, sum);
+                    for (int k = 0; k < GGML_F32_EPR; ++k) {
+                        tmp[k][i1 - ib] = t[k];
+                    }
                 }
-                x[i1] = sumf;
+                for (int k = 0; k < GGML_F32_EPR; ++k) {
+                    memcpy(x + (i2 + k)*nbt + ib, tmp[k], (ie - ib)*sizeof(float));
+                }
+            }
+#endif
+            for (; i2 < n_t; ++i2) {
+                for (int i1 = ib; i1 < ie; ++i1) {
+                    const float * s = (const float *) ((const char *) src0->data + i1*(src0->nb[1]) + i3*(src0->nb[2])) + i2;
+                    const float * c = (const float *) ((const char *) src1->data + i1*(src1->nb[1]));
+
+                    // NOTE: not using ggml_vec_dot_f32, because its sum is in double precision
+                    float sumf = 0.0f;
+
+                    // d_conv
+                    for (int i0 = 0; i0 < nc; ++i0) {
+                        sumf += s[i0] * c[i0];
+                    }
+                    x[i2*nbt + i1] = sumf;
+                }
             }
         }
     }
