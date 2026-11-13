@@ -867,12 +867,44 @@ struct server_slot {
     }
 };
 
+// key of the media chunk at idx in decision.embd_cache, empty if the chunk has no id
+// the slices of one image have the same id, so the key also has the rank of the chunk among them
+static std::string mtmd_chunk_key(const server_tokens & tokens, size_t idx) {
+    const std::string id = mtmd_input_chunk_get_id(tokens.find_chunk(idx).get());
+    if (id.empty()) {
+        return id;
+    }
+    size_t rank = 0;
+    for (size_t i = 0; i < idx; i++) {
+        if (tokens[i] == LLAMA_TOKEN_NULL) {
+            const auto & chunk = tokens.find_chunk(i);
+            rank += id == mtmd_input_chunk_get_id(chunk.get()) ? 1 : 0;
+            i += mtmd_input_chunk_get_n_tokens(chunk.get()) - 1;
+        }
+    }
+    return id + "#" + std::to_string(rank);
+}
+
+// encoder output of the mtmd chunk at idx, nullptr if it is not encoded yet
+static float * get_mtmd_embd(const server_slot & slot, const mtmd::batch_ptr & mbatch, size_t idx) {
+    const auto & input_tokens = slot.task->tokens;
+    const auto & cache = slot.task->decision.embd_cache;
+    if (cache) {
+        const auto it = cache->find(mtmd_chunk_key(input_tokens, idx));
+        if (it != cache->end()) {
+            return it->second.data();
+        }
+    }
+    return mbatch ? mtmd_batch_get_output_embd(mbatch.get(), input_tokens.find_chunk(idx).get()) : nullptr;
+}
+
 // encode the mtmd chunk at idx, batched with as many of the next chunks as possible
 // returns 0 on success
 static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx) {
     const auto & mctx = slot.mctx;
     const auto & input_tokens = slot.task->tokens;
     const auto & chunk = input_tokens.find_chunk(idx);
+    const auto & cache = slot.task->decision.embd_cache;
 
     mbatch.reset(mtmd_batch_init(mctx));
     int32_t res = mtmd_batch_add_chunk(mbatch.get(), chunk.get());
@@ -881,13 +913,20 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
     // try batching as much as possible
     int n_added = 1;
     size_t idx_cur = idx;
+    std::vector<size_t> idx_added = { idx };
     while (res == 0) {
         auto [next_chunk, next_idx] = input_tokens.find_next_media_chunk(idx_cur);
         if (next_chunk == nullptr) {
             break;
         }
+        if (cache && cache->count(mtmd_chunk_key(input_tokens, next_idx)) > 0) {
+            break; // already encoded by another task of the request
+        }
         res = mtmd_batch_add_chunk(mbatch.get(), next_chunk->get());
         n_added += (res == 0 ? 1 : 0);
+        if (res == 0) {
+            idx_added.push_back(next_idx);
+        }
         idx_cur = next_idx;
         SLT_DBG(slot, "try adding media chunk idx = %zu to batch, res = %d\n", next_idx, res);
         // if res != 0, batch is full or chunk is not compatible -> this loop breaks
@@ -900,6 +939,18 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
         return -1;
+    }
+
+    if (cache) {
+        const size_t n_embd = llama_model_n_embd_inp(llama_get_model(slot.ctx_tgt));
+        for (const size_t idx_cur : idx_added) {
+            const auto & cur = input_tokens.find_chunk(idx_cur);
+            const std::string key = mtmd_chunk_key(input_tokens, idx_cur);
+            const float * embd = mtmd_batch_get_output_embd(mbatch.get(), cur.get());
+            if (!key.empty() && embd) {
+                (*cache)[key].assign(embd, embd + mtmd_input_chunk_get_n_tokens(cur.get()) * n_embd);
+            }
+        }
     }
 
     return 0;
@@ -918,8 +969,8 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     int32_t res = 0;
 
     auto try_decode = [&]() -> int32_t {
-        if (mbatch) {
-            float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
+        {
+            float * embd = get_mtmd_embd(slot, mbatch, idx);
             if (embd) {
                 struct cb_data_t {
                     common_speculative * spec;
@@ -4652,14 +4703,14 @@ private:
 
             const auto & chunk = input_tokens.find_chunk(cur_token_idx);
 
-            float * embd = slot.mbatch ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
+            float * embd = get_mtmd_embd(slot, slot.mbatch, cur_token_idx);
             if (!embd) {
                 // encode on the worker thread, so we can still handle metrics tasks
                 int32_t res = 0;
                 queue_tasks.yield_to_queue([&]() {
                     res = encode_mtmd_chunk(slot, slot.mbatch, cur_token_idx);
                 });
-                embd = res == 0 ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
+                embd = res == 0 ? get_mtmd_embd(slot, slot.mbatch, cur_token_idx) : nullptr;
             }
 
             if (!embd || !add_mtmd_chunk(slot, chunk.get(), embd, batch)) {
@@ -6563,6 +6614,8 @@ void server_routes::init_routes() {
         auto & rd = res->rd;
         {
             std::vector<server_task> tasks;
+            // the media are encoded once for all the tasks
+            const auto embd_cache = std::make_shared<std::map<std::string, std::vector<float>>>();
             if (decision.is_joint()) {
                 server_task task = server_task(SERVER_TASK_TYPE_DECISION);
                 task.id = rd.get_new_id();
@@ -6574,6 +6627,7 @@ void server_routes::init_routes() {
                         server_task task = server_task(SERVER_TASK_TYPE_DECISION);
                         task.id = rd.get_new_id();
                         decision.fill_task(state, questions, question, variant, files, ctx_server.mctx, ctx_server.init_opt, task);
+                        task.decision.embd_cache = embd_cache;
                         tasks.push_back(std::move(task));
                     }
                 }

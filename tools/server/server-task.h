@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <memory>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -237,6 +238,10 @@ struct server_task {
         // the scores are the first n_scores rows of the embeddings
         std::vector<int32_t> order;
         int32_t              n_scores = 0;
+
+        // encoder output of the media chunks, shared by the tasks of one request
+        // only used on the server loop thread
+        std::shared_ptr<std::map<std::string, std::vector<float>>> embd_cache;
     };
     decision decision;
 
