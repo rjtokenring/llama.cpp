@@ -635,11 +635,13 @@ static bool htp_matmul_is_hmx_eligible(
         return false;
     }
 
-    if (ne00 % HTP_TENSOR_TILE_N_COLS != 0) {
+    const bool is_tiled = ggml_hexagon_tensor_will_tile(src0);
+
+    // the plain 2D kernel pads K to a multiple of 32 for flat (not tiled) weights
+    if (ne00 % HTP_TENSOR_TILE_N_COLS != 0 && (is_tiled || is_matmul_id || is_batched)) {
         return false;
     }
 
-    const bool is_tiled = ggml_hexagon_tensor_will_tile(src0);
     if (ggml_is_quantized((ggml_type) wtype) && !is_tiled) {
         return false;
     }
@@ -901,7 +903,7 @@ static bool htp_kparams_solve_matmul_impl(
 
     const bool is_tiled    = ggml_hexagon_tensor_will_tile(src0);
     const int  wtype       = (is_tiled && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16)) ? GGML_TYPE_F16 : src0->type;
-    const int  ne00_padded = is_tiled ? hex_round_up(ne00, htp_tensor_get_tile_k(wtype)) : ne00;
+    const int  ne00_padded = hex_round_up(ne00, is_tiled ? htp_tensor_get_tile_k(wtype) : HTP_TENSOR_TILE_N_COLS);
     const int  ne11_padded = hex_round_up(ne11, 32);
     const int  ne01_tiled  = hex_round_up(ne01, 32);
 

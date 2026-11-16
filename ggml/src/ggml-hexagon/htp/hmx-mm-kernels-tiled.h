@@ -32,6 +32,7 @@ struct tiled_dequantize_state {
     uint32_t                  n_tasks;
     uint32_t                  n_cols;
     uint32_t                  k_block;
+    uint32_t                  k_valid;    // flat F16/F32/BF16 rows: the values past k_valid (up to k_block) are zeroed
     size_t                    row_stride;
     uint32_t                  weight_type;
 };
@@ -1042,6 +1043,7 @@ void convert_f16_weight_to_fp16_tiles_task(
         __fp16 *tile_base = state->dst + t * HTP_MM_HMX_TILE_N_ELMS;
         {
             uint32_t byte_off = kt * 32 * sizeof(__fp16);
+            const HVX_VectorPred q_valid = Q6_Q_vsetq2_R(hex_smin((int) state->k_valid - (int) kt * 32, 32) * sizeof(__fp16));
 
             HVX_Vector v_off = v_scat_base;
             for (uint32_t r = 0; r < HTP_MM_HMX_TILE_N_ROWS; r += 2) {
@@ -1053,6 +1055,8 @@ void convert_f16_weight_to_fp16_tiles_task(
 
                 HVX_Vector v0 = (row0 < state->n_cols) ? hvx_vmemu((const __fp16 *)(r0 + byte_off)) : Q6_V_vzero();
                 HVX_Vector v1 = (row1 < state->n_cols) ? hvx_vmemu((const __fp16 *)(r1 + byte_off)) : Q6_V_vzero();
+                v0 = Q6_V_vmux_QVV(q_valid, v0, Q6_V_vzero());
+                v1 = Q6_V_vmux_QVV(q_valid, v1, Q6_V_vzero());
 
                 Q6_vscatter_QRMVwV(q_mask64, (size_t)tile_base, HTP_MM_HMX_TILE_SIZE - 1, v_off, v0);
                 v_off = Q6_Vw_vadd_VwVw(v_off, v_scat_step);
@@ -1085,6 +1089,7 @@ void quantize_f32_weight_to_fp16_tiles_task(
         __fp16 *tile_base = state->dst + t * HTP_MM_HMX_TILE_N_ELMS;
         {
             uint32_t byte_off = kt * 32 * sizeof(float);
+            const HVX_VectorPred q_valid = Q6_Q_vsetq2_R(hex_smin((int) state->k_valid - (int) kt * 32, 32) * sizeof(float));
 
             HVX_Vector v_off = v_scat_base;
             for (uint32_t r = 0; r < HTP_MM_HMX_TILE_N_ROWS; r += 2) {
@@ -1096,6 +1101,8 @@ void quantize_f32_weight_to_fp16_tiles_task(
 
                 HVX_Vector v0_f32 = (row0 < state->n_cols) ? hvx_vmem((const float *)(r0 + byte_off)) : Q6_V_vzero();
                 HVX_Vector v1_f32 = (row1 < state->n_cols) ? hvx_vmem((const float *)(r1 + byte_off)) : Q6_V_vzero();
+                v0_f32 = Q6_V_vmux_QVV(q_valid, v0_f32, Q6_V_vzero());
+                v1_f32 = Q6_V_vmux_QVV(q_valid, v1_f32, Q6_V_vzero());
 
                 HVX_Vector v_out = hvx_vec_f32_to_f16(v0_f32, v1_f32);
 
@@ -1132,6 +1139,7 @@ void convert_bf16_weight_to_fp16_tiles_task(
         __fp16 *tile_base = state->dst + t * HTP_MM_HMX_TILE_N_ELMS;
         {
             uint32_t byte_off = kt * 32 * sizeof(uint16_t);
+            const HVX_VectorPred q_valid = Q6_Q_vsetq2_R(hex_smin((int) state->k_valid - (int) kt * 32, 32) * sizeof(uint16_t));
 
             HVX_Vector v_off = v_scat_base;
             for (uint32_t r = 0; r < HTP_MM_HMX_TILE_N_ROWS; r += 2) {
@@ -1143,6 +1151,8 @@ void convert_bf16_weight_to_fp16_tiles_task(
 
                 HVX_Vector v0_raw = (row0 < state->n_cols) ? hvx_vmemu((const void *)(r0 + byte_off)) : Q6_V_vzero();
                 HVX_Vector v1_raw = (row1 < state->n_cols) ? hvx_vmemu((const void *)(r1 + byte_off)) : Q6_V_vzero();
+                v0_raw = Q6_V_vmux_QVV(q_valid, v0_raw, Q6_V_vzero());
+                v1_raw = Q6_V_vmux_QVV(q_valid, v1_raw, Q6_V_vzero());
 
                 HVX_Vector v0_f32 = Q6_Vw_vasl_VwR(Q6_V_lo_W(Q6_Ww_vunpack_Vh(v0_raw)), 16);
                 HVX_Vector v1_f32 = Q6_Vw_vasl_VwR(Q6_V_lo_W(Q6_Ww_vunpack_Vh(v1_raw)), 16);

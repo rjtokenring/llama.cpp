@@ -11983,6 +11983,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
             test_cases.emplace_back(new test_mul_mat_add(type_a, 2048, n, 2048, MUL_MAT_ADD_B_INPLACE));
         }
+        // a K that is not a multiple of 32
+        for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+            for (mul_mat_add_mode mode : {MUL_MAT_ADD_MM_RES, MUL_MAT_ADD_ROW}) {
+                test_cases.emplace_back(new test_mul_mat_add(type_a, 1000, n, 1000, mode));
+            }
+        }
         // the widest tiles with two src1 tiles, and src1 rows padded in memory
         for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 8192, n, 512,  {1, 1}, {1, 1}));
