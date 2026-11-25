@@ -3972,7 +3972,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                 vec_to_str<uint32_t, 16>(opt_pmu_evt).c_str());
     }
 
-    reg->context = new ggml_hexagon_registry(reg);
+    // static owner: sessions are released at exit, before the driver library (loaded earlier) is closed
+    static std::unique_ptr<ggml_hexagon_registry> registry;
+    registry     = std::make_unique<ggml_hexagon_registry>(reg);
+    reg->context = registry.get();
 }
 
 static const struct ggml_backend_reg_i ggml_backend_hexagon_reg_i = {
