@@ -2160,6 +2160,8 @@ void ggml_hexagon_session::mmap_early(ggml_hexagon_shared_buffer * sbuf) {
         sbuf->mmap();
     } catch (const std::exception &) {
         GGML_LOG_WARN("ggml-hex: %s remapping the session buffers largest first\n", this->c_name());
+        // nothing may still run on the buffers that get unmapped
+        this->flush_sync();
         for (auto * b : this->buffers) {
             b->unmap();
         }
