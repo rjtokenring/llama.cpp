@@ -70,6 +70,7 @@ using uintvec = std::vector<unsigned int>;
 using u32vec  = std::vector<uint32_t>;
 
 #define GGML_HEXAGON_MAX_SESSIONS          16
+#define GGML_HEXAGON_EARLY_MAP_SIZE        ((size_t) 128 << 20) // buffers this large are mapped at allocation
 
 struct ggml_hexagon_device_config {
     int         physical_idx = 0;
@@ -380,6 +381,7 @@ struct ggml_hexagon_session {
     void flush_pending(bool all = true);
 
     void mmap_buffers();
+    void mmap_early(ggml_hexagon_shared_buffer*);
     void clone_buffer(const ggml_hexagon_shared_buffer*);
     void release_buffer(const ggml_hexagon_shared_buffer*);
     void unclone_buffer(const ggml_hexagon_shared_buffer*);
@@ -960,8 +962,13 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(
         return nullptr;
     }
     try {
-        ggml_hexagon_shared_buffer * sbuf = new ggml_hexagon_shared_buffer(sess, size, false);
-        return ggml_backend_buffer_init(buffer_type, ggml_backend_hexagon_buffer_interface, sbuf, size);
+        auto sbuf = std::make_unique<ggml_hexagon_shared_buffer>(sess, size, false);
+        // map large buffers now: a mapping failure is then an allocation failure, not an abort at compute time
+        // (dma64 picks the mapping type at first use)
+        if (!opt_dma64 && size >= GGML_HEXAGON_EARLY_MAP_SIZE) {
+            sess->mmap_early(sbuf.get());
+        }
+        return ggml_backend_buffer_init(buffer_type, ggml_backend_hexagon_buffer_interface, sbuf.release(), size);
     } catch (const std::exception & exc) {
         GGML_LOG_ERROR("ggml-hex: %s failed to allocate device buffer context: %s\n", dev_ctx->c_name(), exc.what());
         return nullptr;
@@ -2140,6 +2147,27 @@ void ggml_hexagon_session::mmap_buffers() {
         });
         for (auto * sbuf : sorted) {
             sbuf->mmap();
+        }
+    }
+}
+
+// Map a buffer at allocation time. Mappings take power-of-2 IOVA slots, so the allocation order can leave no
+// slot for a buffer that fits when everything is mapped largest first: on failure remap all the session buffers
+// in that order (mmap_buffers). Throws if the buffer still does not fit.
+void ggml_hexagon_session::mmap_early(ggml_hexagon_shared_buffer * sbuf) {
+    this->buffers.insert(sbuf);
+    try {
+        sbuf->mmap();
+    } catch (const std::exception &) {
+        GGML_LOG_WARN("ggml-hex: %s remapping the session buffers largest first\n", this->c_name());
+        for (auto * b : this->buffers) {
+            b->unmap();
+        }
+        try {
+            this->mmap_buffers();
+        } catch (const std::exception &) {
+            this->buffers.erase(sbuf);
+            throw;
         }
     }
 }
